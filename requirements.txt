@@ -3,8 +3,6 @@ pandas
 openpyxl
 tiktoken
 faiss-cpu
-langchain
-langchain-openai
 duckdb
 beautifulsoup4
 lxml
@@ -12,6 +10,8 @@ regex
 tqdm
 python-dotenv
 rapidfuzz
+
+# LangChain tách gói từ 2024 ⇒ cần đồng bộ phiên bản
 langchain>=0.2.10
 langchain-core>=0.2.10
 langchain-openai>=0.1.7
