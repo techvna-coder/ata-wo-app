@@ -1,0 +1,14 @@
+streamlit
+pandas
+openpyxl
+tiktoken
+faiss-cpu
+langchain
+langchain-openai
+duckdb
+beautifulsoup4
+lxml
+regex
+tqdm
+python-dotenv
+rapidfuzz
