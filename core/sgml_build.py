@@ -1,18 +1,28 @@
 # core/sgml_build.py
-import os, tarfile, re, json, shutil, uuid
+import os, tarfile, re, json, shutil, uuid, time
 from pathlib import Path
-from typing import Iterator, Dict, List, Tuple, Optional
+from typing import Iterator, Dict, List, Tuple, Optional, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
-
 import duckdb
 
+# Fallback Document
+try:
+    from langchain_core.documents import Document
+except Exception:
+    from langchain.schema import Document  # fallback
+
+# Fallback Embeddings
+try:
+    from langchain_openai import OpenAIEmbeddings
+except Exception:
+    from langchain.embeddings import OpenAIEmbeddings  # fallback
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 TASK_PATTERN = re.compile(r'\b(\d{2})-(\d{2})-(\d{2})(?:-(\d{3})(?:-(\d{3}))*)?\b')
-# Một số OEM viết 212600 → chuẩn hóa về 21-26-00
 TASK_COMPACT = re.compile(r'\b(\d{2})(\d{2})(\d{2})(?:(\d{3}))?(?:(\d{3}))?\b')
 
 def _norm_task_code(raw: str) -> Optional[str]:
@@ -53,35 +63,26 @@ def _get_text(node) -> str:
     return " ".join(node.stripped_strings) if node else ""
 
 def parse_one_sgml(path: str, manual_type: str) -> List[Dict]:
-    """
-    Trả về danh sách task records:
-    {task_full, ata04, title, doc_type, source_file, content}
-    """
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         data = f.read()
-    # Parse “mềm” để chịu được SGML/DTD
-    soup = BeautifulSoup(data, "lxml")  # hoặc "html.parser" nếu lỗi lxml
+    # Parsers: thử lxml trước, nếu “khó” có thể đổi thành html.parser
+    soup = BeautifulSoup(data, "lxml")
 
     records: List[Dict] = []
-
-    # Heuristic theo iSpec 2200/S1000D: task, dm, proc, topic, chap…
-    # Ưu tiên thẻ có số hiệu riêng; fallback: regex quét toàn file theo block.
     candidates = []
     for tag in ["task", "dm", "procedure", "topic", "chapter", "section"]:
         candidates.extend(soup.find_all(tag))
 
     if candidates:
         for blk in candidates:
-            # tìm tiêu đề
             title = None
             for ttag in ["title", "tasktitle", "name", "caption", "heading"]:
                 tt = blk.find(ttag)
                 if tt: 
                     title = _get_text(tt)
                     break
-            # tìm task number
+
             task_full = None
-            # 1) thuộc tính/element chuyên biệt
             for key in ["tasknumber", "task", "dmcode", "id", "code", "ident"]:
                 v = blk.get(key) if hasattr(blk, "get") else None
                 task_full = _norm_task_code(v) or task_full
@@ -91,7 +92,6 @@ def parse_one_sgml(path: str, manual_type: str) -> List[Dict]:
                     if el:
                         task_full = _norm_task_code(el.get_text())
                         if task_full: break
-            # 2) fallback: quét text khối
             if not task_full:
                 task_full = _norm_task_code(_get_text(blk))
             if not task_full:
@@ -107,12 +107,11 @@ def parse_one_sgml(path: str, manual_type: str) -> List[Dict]:
                 "content": content
             })
     else:
-        # Không có thẻ gợi ý → fallback: cắt theo regex toàn file
+        # Fallback: quét bằng regex toàn file
         for m in TASK_PATTERN.finditer(data):
             task_full = _norm_task_code(m.group(0))
             if not task_full: 
                 continue
-            # lấy vùng lân cận làm content
             start = max(0, m.start() - 1500)
             end = min(len(data), m.end() + 2500)
             snippet = data[start:end]
@@ -127,6 +126,19 @@ def parse_one_sgml(path: str, manual_type: str) -> List[Dict]:
             })
     return records
 
+def parse_files_parallel(file_paths: List[str], manual_type: str, max_workers: int = 4) -> Iterable[Dict]:
+    def _worker(fp):
+        try:
+            return parse_one_sgml(fp, manual_type)
+        except Exception:
+            return []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(_worker, fp) for fp in file_paths]
+        for fut in as_completed(futures):
+            recs = fut.result()
+            for r in recs:
+                yield r
+
 def build_registry_and_chunks(
     extracted_dir: str,
     manual_type: str,
@@ -134,27 +146,27 @@ def build_registry_and_chunks(
     vector_dir: str,
     openai_api_key: str,
     chunk_size: int = 1000,
-    chunk_overlap: int = 150
+    chunk_overlap: int = 150,
+    embedding_model: str = "text-embedding-3-small",
+    embed_batch_size: int = 64,
+    shard_size: int = 3000,
+    max_workers_parse: int = 4,
+    no_embed: bool = False,
+    resume: bool = False,
 ) -> Tuple[int, int]:
-    """
-    Duyệt toàn bộ SGML → DuckDB 'refs' + FAISS vectorstore.
-    Trả về (số_task, số_chunk).
-    """
-    # 1) Parse → records
-    all_records: List[Dict] = []
+
+    from math import inf
+    # Fallback FAISS import
+    try:
+        from langchain_community.vectorstores import FAISS
+    except Exception:
+        from langchain.vectorstores import FAISS  # fallback
+
     files = list(iter_sgml_files(extracted_dir))
-    for fp in tqdm(files, desc=f"Parsing {manual_type} SGML"):
-        try:
-            recs = parse_one_sgml(fp, manual_type)
-            all_records.extend(recs)
-        except Exception as e:
-            # Bỏ qua file lỗi (ghi log nếu cần)
-            pass
+    if not files:
+        raise RuntimeError("Không tìm thấy file SGML/XML trong thư mục.")
 
-    if not all_records:
-        raise RuntimeError("Không tìm thấy task hợp lệ trong SGML.")
-
-    # 2) Ghi registry vào DuckDB
+    # DuckDB
     con = duckdb.connect(duckdb_path)
     con.execute("""
         CREATE TABLE IF NOT EXISTS refs(
@@ -167,42 +179,65 @@ def build_registry_and_chunks(
             source_file TEXT
         )
     """)
-    # page: SGML không có page theo PDF → để NULL; nếu SGML có số trang, có thể map sau.
-    # task_short = AA-BB-CC
-    rows = []
-    for r in all_records:
-        aa_bb_cc = None
-        m = TASK_PATTERN.search(r["task_full"])
-        if m:
-            aa_bb_cc = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-        rows.append((
-            r["task_full"], aa_bb_cc, r["ata04"], r["doc_type"], r["title"], None, r["source_file"]
-        ))
-    con.execute("DELETE FROM refs WHERE manual_type = ?", [manual_type])
-    con.executemany("INSERT INTO refs VALUES (?,?,?,?,?,?,?)", rows)
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+
+    # Shard & resume
+    os.makedirs(vector_dir, exist_ok=True)
+    existing_shards = sorted([d for d in os.listdir(vector_dir) if d.startswith("shard_")])
+    shard_idx = (int(existing_shards[-1].split("_")[1]) + 1) if (resume and existing_shards) else 1
+
+    # Embeddings
+    if not no_embed:
+        embeddings = OpenAIEmbeddings(api_key=openai_api_key, model=embedding_model)
+
+    total_tasks = 0
+    total_chunks = 0
+    duckdb_rows: List[Tuple] = []
+    shard_docs: List[Document] = []
+
+    def flush_duckdb_rows(rows):
+        if not rows:
+            return
+        con.executemany("INSERT INTO refs VALUES (?,?,?,?,?,?,?)", rows)
+        rows.clear()
+
+    def save_faiss_shard(shard_docs: List[Document], shard_idx: int):
+        if not shard_docs:
+            return 0
+        store = FAISS.from_documents(shard_docs, embeddings)
+        shard_dir = os.path.join(vector_dir, f"shard_{shard_idx:04d}")
+        os.makedirs(shard_dir, exist_ok=True)
+        store.save_local(shard_dir)
+        return len(shard_docs)
+
+    # Parse song song → ghi DuckDB theo lô → chunk → nhúng thành shard
+    for rec in parse_files_parallel(files, manual_type, max_workers=max_workers_parse):
+        m = TASK_PATTERN.search(rec["task_full"])
+        aa_bb_cc = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+        duckdb_rows.append((rec["task_full"], aa_bb_cc, rec["ata04"], rec["doc_type"], rec["title"], None, rec["source_file"]))
+        total_tasks += 1
+        if len(duckdb_rows) >= 2000:
+            flush_duckdb_rows(duckdb_rows)
+
+        for i, ch in enumerate(splitter.split_text(rec["content"])):
+            meta = {
+                "task_full": rec["task_full"], "ata04": rec["ata04"], "doc_type": rec["doc_type"],
+                "title": rec["title"], "source_file": rec["source_file"], "chunk_id": f"{rec['task_full']}#{i}"
+            }
+            shard_docs.append(Document(page_content=ch, metadata=meta))
+            total_chunks += 1
+
+            if (not no_embed) and len(shard_docs) >= shard_size:
+                save_faiss_shard(shard_docs, shard_idx)
+                shard_docs.clear()
+                shard_idx += 1
+
+    flush_duckdb_rows(duckdb_rows)
     con.close()
 
-    # 3) Chunking → Documents
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    docs: List[Document] = []
-    for r in all_records:
-        chunks = splitter.split_text(r["content"])
-        for i, ch in enumerate(chunks):
-            meta = {
-                "task_full": r["task_full"],
-                "ata04": r["ata04"],
-                "doc_type": r["doc_type"],
-                "title": r["title"],
-                "source_file": r["source_file"],
-                "chunk_id": f"{r['task_full']}#{i}"
-            }
-            docs.append(Document(page_content=ch, metadata=meta))
+    if not no_embed and shard_docs:
+        save_faiss_shard(shard_docs, shard_idx)
+        shard_docs.clear()
 
-    # 4) Embedding + FAISS
-    from langchain_community.vectorstores import FAISS
-    os.makedirs(vector_dir, exist_ok=True)
-    embeddings = OpenAIEmbeddings(api_key=openai_api_key)
-    store = FAISS.from_documents(docs, embeddings)
-    store.save_local(vector_dir)
-
-    return (len(all_records), len(docs))
+    return (total_tasks, total_chunks)
