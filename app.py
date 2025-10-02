@@ -131,50 +131,44 @@ def normalize_query(defect, rect):
 # RAG: chọn ứng viên từ manuals
 # -----------------------
 
-def derive_from_manuals(stores: dict, query: str, prefer_order=("TSM", "FIM", "AMM"), topk=4):
-    """
-    Tra cứu RAG với thứ tự ưu tiên manuals.
-    stores: {"TSM": FAISS, "AMM": FAISS, ...}
-    Trả về dict: {ata04_derived, task_full, doc_type, score, title, source_file, snippet}
-    hoặc None nếu không có ứng viên đủ điểm.
-    """
-    best = None
-    for mt in prefer_order:
-        store = stores.get(mt)
-        if not store:
-            continue
+def _search_store_any(store_or_list, query, k):
+    """Tìm best hit trong 1 store hoặc danh sách nhiều shard; trả về (doc, score) tốt nhất."""
+    best_doc, best_score = None, -1.0
+    stores = store_or_list if isinstance(store_or_list, list) else [store_or_list]
+    for s in stores:
         try:
-            hits = store.similarity_search_with_score(query, k=topk)
+            hits = s.similarity_search_with_score(query, k=k)
         except Exception:
             hits = []
-        # hits: list[(Document, score)] với score càng nhỏ càng tốt hoặc ngược? Tùy implementation.
-        # LangChain FAISS .similarity_search_with_score trả về (doc, score) với score = distance.
-        # Đổi về "similarity" giả định bằng 1/(1+distance) để thuận trực giác 0..1
         for doc, dist in hits:
-            score = 1.0 / (1.0 + float(dist))
-            ata04 = doc.metadata.get("ata04")
-            task_full = doc.metadata.get("task_full")
-            title = doc.metadata.get("title", "")
-            src = doc.metadata.get("source_file", "")
-            snippet = doc.page_content[:800]
-            candidate = {
-                "ata04_derived": normalize_ata4(ata04),
-                "task_full": task_full,
+            # score = 1/(1+distance)
+            sim = 1.0 / (1.0 + float(dist))
+            if sim > best_score:
+                best_doc, best_score = doc, sim
+    return best_doc, best_score
+
+def derive_from_manuals(stores: dict, query: str, prefer_order=("TSM", "FIM", "AMM"), topk=4):
+    best = None
+    for mt in prefer_order:
+        stobj = stores.get(mt)
+        if not stobj:
+            continue
+        doc, score = _search_store_any(stobj, query, topk)
+        if doc:
+            cand = {
+                "ata04_derived": normalize_ata4(doc.metadata.get("ata04")),
+                "task_full": doc.metadata.get("task_full"),
                 "doc_type": mt,
                 "score": score,
-                "title": title,
-                "source_file": src,
-                "snippet": snippet
+                "title": doc.metadata.get("title", ""),
+                "source_file": doc.metadata.get("source_file", ""),
+                "snippet": doc.page_content[:800],
             }
-            if not best or candidate["score"] > best["score"]:
-                best = candidate
-        # Nếu đã tìm được ứng viên khá tốt ở manuals ưu tiên → dừng sớm
+            if cand["ata04_derived"] and (not best or cand["score"] > best["score"]):
+                best = cand
         if best and best["score"] >= DERIVED_SCORE_STRONG:
             break
-    # áp ngưỡng tối thiểu
-    if best and best["score"] >= DERIVED_SCORE_GOOD and best["ata04_derived"]:
-        return best
-    return None
+    return best if (best and best["score"] >= DERIVED_SCORE_GOOD and best["ata04_derived"]) else None
 
 # -----------------------
 # Triangulation (Tam-đối-soát)
@@ -251,15 +245,28 @@ def get_openai_key():
     return key
 
 def ensure_stores_loaded(api_key):
-    """Nạp FAISS stores vào session_state: ['TSM','FIM','AMM'] nếu có"""
+    """Nạp FAISS stores (hỗ trợ nhiều shard) vào session_state: ['TSM','FIM','AMM']"""
     if "stores" not in st.session_state:
         st.session_state.stores = {}
     for mt in ["tsm", "fim", "amm"]:
-        vec_dir = os.path.join("vectorstore", mt)
-        if os.path.isdir(vec_dir) and os.listdir(vec_dir) and (mt.upper() not in st.session_state.stores):
+        base_dir = os.path.join("vectorstore", mt)
+        if not os.path.isdir(base_dir):
+            continue
+        shard_dirs = sorted([os.path.join(base_dir, d) for d in os.listdir(base_dir) if d.startswith("shard_")])
+        if shard_dirs:
+            stores = []
+            for sd in shard_dirs:
+                try:
+                    stores.append(load_faiss(sd, api_key))
+                except Exception:
+                    pass
+            if stores:
+                st.session_state.stores[mt.upper()] = stores
+        else:
+            # fallback: 1 index duy nhất
             try:
-                st.session_state.stores[mt.upper()] = load_faiss(vec_dir, api_key)
-            except Exception as e:
+                st.session_state.stores[mt.upper()] = load_faiss(base_dir, api_key)
+            except Exception:
                 pass
 
 def ensure_registry_loaded():
