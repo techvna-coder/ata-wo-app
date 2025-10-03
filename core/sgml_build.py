@@ -1,41 +1,63 @@
 # core/sgml_build.py
-import os, tarfile, re, shutil, time
+# ------------------------------------------------------------------------------------
+# SGML → DuckDB (refs) + FAISS (sharded)
+# - Parse SGML/XML (TSM/FIM/AMM) an toàn (BeautifulSoup + lxml, fallback regex)
+# - Ghi DuckDB theo lô
+# - Chunk → Embed (OpenAIEmbeddings) với retry + token clipping
+# - Sharding + Resume cho FAISS
+# - Tương thích nhiều phiên bản langchain_* khi tạo FAISS từ embeddings
+# ------------------------------------------------------------------------------------
+
+import os
+import re
+import tarfile
+import time
+import shutil
 from pathlib import Path
 from typing import Iterator, Dict, List, Tuple, Optional, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import duckdb
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-import duckdb
 import tiktoken
 
 # Fallback Document
 try:
     from langchain_core.documents import Document
 except Exception:
-    from langchain.schema import Document  # fallback
+    from langchain.schema import Document  # fallback rất cũ
 
 # Fallback Embeddings
 try:
     from langchain_openai import OpenAIEmbeddings
 except Exception:
-    from langchain.embeddings import OpenAIEmbeddings  # fallback
+    from langchain.embeddings import OpenAIEmbeddings  # fallback rất cũ
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# Fallback FAISS
+# Fallback FAISS Vectorstore (class wrapper)
 try:
     from langchain_community.vectorstores import FAISS
 except Exception:
-    from langchain.vectorstores import FAISS  # fallback
+    from langchain.vectorstores import FAISS  # fallback rất cũ
 
-TASK_PATTERN = re.compile(r'\b(\d{2})-(\d{2})-(\d{2})(?:-(\d{3})(?:-(\d{3}))*)?\b')
-TASK_COMPACT = re.compile(r'\b(\d{2})(\d{2})(\d{2})(?:(\d{3}))?(?:(\d{3}))?\b')
+
+# -------------------------
+# Regex nhận diện task/ATA
+# -------------------------
+TASK_PATTERN = re.compile(
+    r'\b(\d{2})-(\d{2})-(\d{2})(?:-(\d{3})(?:-(\d{3}))*)?\b'
+)
+TASK_COMPACT = re.compile(
+    r'\b(\d{2})(\d{2})(\d{2})(?:(\d{3}))?(?:(\d{3}))?\b', re.I
+)
 
 def _norm_task_code(raw: str) -> Optional[str]:
-    if not raw: 
+    """Chuẩn hóa chuỗi về định dạng task: AA-BB-CC(-DDD-EEE…)."""
+    if not raw:
         return None
-    raw = raw.strip()
+    raw = str(raw).strip()
     m = TASK_PATTERN.search(raw)
     if m:
         aa, bb, cc = m.group(1), m.group(2), m.group(3)
@@ -49,11 +71,17 @@ def _norm_task_code(raw: str) -> Optional[str]:
     return None
 
 def _ata04_from_task(task_full: str) -> Optional[str]:
-    if not task_full: return None
+    if not task_full:
+        return None
     m = TASK_PATTERN.search(task_full)
-    if not m: return None
+    if not m:
+        return None
     return f"{m.group(1)}-{m.group(2)}"
 
+
+# -------------------------
+# I/O tiện ích
+# -------------------------
 def extract_tar(tar_path: str, out_dir: str) -> str:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -69,10 +97,17 @@ def iter_sgml_files(root: str) -> Iterator[str]:
 def _get_text(node) -> str:
     return " ".join(node.stripped_strings) if node else ""
 
+
+# -------------------------
+# Parse SGML/XML → records
+# -------------------------
 def parse_one_sgml(path: str, manual_type: str) -> List[Dict]:
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        data = f.read()
-    # Thử lxml trước; nếu cần có thể đổi "html.parser" cho 1 số OEM đặc thù
+    """Trả về danh sách record: task_full, ata04, title, doc_type, source_file, content."""
+    try:
+        data = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+
     soup = BeautifulSoup(data, "lxml")
 
     records: List[Dict] = []
@@ -85,20 +120,24 @@ def parse_one_sgml(path: str, manual_type: str) -> List[Dict]:
             title = None
             for ttag in ["title", "tasktitle", "name", "caption", "heading"]:
                 tt = blk.find(ttag)
-                if tt: 
+                if tt:
                     title = _get_text(tt)
                     break
 
             task_full = None
+            # Thử thuộc tính
             for key in ["tasknumber", "task", "dmcode", "id", "code", "ident"]:
                 v = blk.get(key) if hasattr(blk, "get") else None
                 task_full = _norm_task_code(v) or task_full
+            # Thử nội dung các thẻ con
             if not task_full:
                 for t in ["tasknumber", "dmcode", "ref", "id", "code"]:
                     el = blk.find(t)
                     if el:
                         task_full = _norm_task_code(el.get_text())
-                        if task_full: break
+                        if task_full:
+                            break
+            # Fallback: regex toàn block
             if not task_full:
                 task_full = _norm_task_code(_get_text(blk))
             if not task_full:
@@ -114,23 +153,23 @@ def parse_one_sgml(path: str, manual_type: str) -> List[Dict]:
                 "content": content
             })
     else:
-        # Fallback: regex toàn file
+        # Fallback regex toàn file
         for m in TASK_PATTERN.finditer(data):
             task_full = _norm_task_code(m.group(0))
-            if not task_full: 
+            if not task_full:
                 continue
             start = max(0, m.start() - 1500)
             end = min(len(data), m.end() + 2500)
             snippet = data[start:end]
-            title = ""
             records.append({
                 "task_full": task_full,
                 "ata04": _ata04_from_task(task_full),
-                "title": title,
+                "title": "",
                 "doc_type": manual_type,
                 "source_file": path,
                 "content": BeautifulSoup(snippet, "lxml").get_text(" ", strip=True)
             })
+
     return records
 
 def parse_files_parallel(file_paths: List[str], manual_type: str, max_workers: int = 4) -> Iterable[Dict]:
@@ -146,7 +185,10 @@ def parse_files_parallel(file_paths: List[str], manual_type: str, max_workers: i
             for r in recs:
                 yield r
 
-# --------- Token utils ----------
+
+# -------------------------
+# Token utils (tiktoken)
+# -------------------------
 def _tiktoken_len(text: str, model: str = "text-embedding-3-small") -> int:
     try:
         enc = tiktoken.encoding_for_model(model)
@@ -166,8 +208,10 @@ def _clip_to_tokens(text: str, max_tokens: int, model: str = "text-embedding-3-s
         return text
     return enc.decode(ids[:max_tokens])
 
-# ---------------------------------
 
+# -------------------------
+# Build pipeline chính
+# -------------------------
 def build_registry_and_chunks(
     extracted_dir: str,
     manual_type: str,
@@ -182,15 +226,18 @@ def build_registry_and_chunks(
     max_workers_parse: int = 4,
     no_embed: bool = False,
     resume: bool = False,
-    # Giới hạn an toàn cho mỗi item khi gọi embeddings (tối đa per-request 8192 token cho t-e-3-*)
+    # giới hạn an toàn cho mỗi item embeddings (gần ngưỡng 8k tokens của dòng t-e-3-*)
     per_item_token_max: int = 7900,
 ) -> Tuple[int, int]:
+    """
+    Trả về: (số task ghi DuckDB, số chunk đã xử lý)
+    """
 
     files = list(iter_sgml_files(extracted_dir))
     if not files:
         raise RuntimeError("Không tìm thấy file SGML/XML trong thư mục.")
 
-    # DuckDB
+    # 1) DuckDB: tạo bảng nếu chưa có
     con = duckdb.connect(duckdb_path)
     con.execute("""
         CREATE TABLE IF NOT EXISTS refs(
@@ -206,14 +253,16 @@ def build_registry_and_chunks(
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
-    # Shard & resume
+    # 2) Shard & resume
     os.makedirs(vector_dir, exist_ok=True)
     existing_shards = sorted([d for d in os.listdir(vector_dir) if d.startswith("shard_")])
     shard_idx = (int(existing_shards[-1].split("_")[1]) + 1) if (resume and existing_shards) else 1
 
-    # Embeddings
+    # 3) Embeddings
     if not no_embed:
         embeddings = OpenAIEmbeddings(api_key=openai_api_key, model=embedding_model)
+    else:
+        embeddings = None  # type: ignore
 
     total_tasks = 0
     total_chunks = 0
@@ -226,10 +275,14 @@ def build_registry_and_chunks(
         con.executemany("INSERT INTO refs VALUES (?,?,?,?,?,?,?)", rows)
         rows.clear()
 
-    def _embed_texts_with_retry(texts: List[str]) -> List[List[float]]:
-        # Loại bỏ None, chuẩn hoá, cắt token & bỏ rỗng
+    def _embed_texts_with_retry(texts: List[str]) -> List[Optional[List[float]]]:
+        """Chuẩn hoá + cắt token + embed theo batch, có retry/backoff. Trả về list vector/None."""
+        if embeddings is None:
+            # nếu no_embed=True, không embed
+            return [None] * len(texts)
+
         clean_texts = []
-        idx_map = []  # map từ clean_texts index -> texts index
+        idx_map = []
         skipped = 0
         for i, t in enumerate(texts):
             t = (t or "").strip()
@@ -243,86 +296,156 @@ def build_registry_and_chunks(
                 continue
             clean_texts.append(t)
             idx_map.append(i)
+
         if not clean_texts:
             return [None] * len(texts)
 
-        # Batch + retry + backoff
-        vecs_all: List[List[float]] = [None] * len(texts)
+        vecs_all: List[Optional[List[float]]] = [None] * len(texts)
         start = 0
         while start < len(clean_texts):
             batch = clean_texts[start:start+embed_batch_size]
             for attempt in range(6):
                 try:
-                    vecs = embeddings.embed_documents(batch)
+                    vecs = embeddings.embed_documents(batch)  # type: ignore
                     break
-                except Exception as e:
-                    # backoff luỹ thừa 1s,2s,4s,8s,16s,32s
+                except Exception:
+                    # backoff 1,2,4,8,16,32s
                     time.sleep(1.0 * (2 ** attempt))
                     if attempt == 5:
                         raise
             for j, v in enumerate(vecs):
                 vecs_all[idx_map[start+j]] = v
             start += embed_batch_size
+
         return vecs_all
 
-    def save_faiss_shard(shard_docs: List[Document], shard_idx: int):
+    def save_faiss_shard(shard_docs: List[Document], shard_idx: int) -> int:
+        """
+        Tạo & lưu một shard FAISS từ danh sách Document:
+        - Tách vectors / texts / metadatas / ids
+        - Thử nhiều chữ ký from_embeddings(...) để tương thích phiên bản
+        - Fallback: tự dựng faiss.IndexFlatL2 + InMemoryDocstore
+        """
         if not shard_docs:
             return 0
-        # Chuẩn bị texts & metadatas
-        texts = [d.page_content for d in shard_docs]
-        metas = [d.metadata for d in shard_docs]
 
-        # Tính embedding với kiểm soát chặt chẽ
+        # 1) Chuẩn bị dữ liệu
+        texts = [d.page_content or "" for d in shard_docs]
+        metas = [d.metadata or {} for d in shard_docs]
+
+        # 2) Tính embedding có kiểm soát
         vecs = _embed_texts_with_retry(texts)
 
-        # Lọc bỏ phần tử lỗi hoặc None
-        tuples = []
+        # 3) Lọc lỗi
+        vectors, texts_ok, metas_ok, ids_ok = [], [], [], []
         dropped = 0
-        for v, d in zip(vecs, shard_docs):
+        for i, (v, t, m) in enumerate(zip(vecs, texts, metas)):
             if v is None:
                 dropped += 1
                 continue
-            tuples.append((v, d))
+            vectors.append(v)
+            texts_ok.append(t)
+            metas_ok.append(m)
+            cid = m.get("chunk_id") if isinstance(m, dict) else None
+            ids_ok.append(str(cid) if cid else f"{shard_idx:04d}_{i:06d}")
 
-        if not tuples:
+        if not vectors:
             return 0
 
-        # Tạo store từ embedding trực tiếp
-        store = FAISS.from_embeddings(tuples)
+        # 4) Xây Vectorstore
+        try:
+            # New-style: keyword params đầy đủ
+            store = FAISS.from_embeddings(
+                embeddings=vectors,
+                texts=texts_ok,
+                metadatas=metas_ok,
+                ids=ids_ok,
+                embedding=embeddings  # type: ignore
+            )
+        except TypeError:
+            try:
+                # Old-style: positional / hỗn hợp (tuỳ version)
+                store = FAISS.from_embeddings(
+                    vectors,
+                    metadatas=metas_ok,
+                    ids=ids_ok,
+                    embedding=embeddings,  # type: ignore
+                    texts=texts_ok
+                )
+            except Exception:
+                # Fallback thủ công
+                try:
+                    import numpy as np
+                except Exception as e:
+                    raise RuntimeError("Thiếu numpy – cần 'numpy' để dựng FAISS thủ công.") from e
+                try:
+                    import faiss as faiss_lib
+                except Exception as e:
+                    raise RuntimeError("Thiếu faiss – cần 'faiss-cpu' để dựng FAISS thủ công.") from e
+                try:
+                    from langchain_community.docstore.in_memory import InMemoryDocstore
+                except Exception:
+                    from langchain.docstore.in_memory import InMemoryDocstore  # fallback rất cũ
 
+                dim = len(vectors[0])
+                index = faiss_lib.IndexFlatL2(dim)
+                index.add((__import__("numpy")).array(vectors, dtype="float32"))
+
+                # map id -> Document
+                docstore_dict = {ids_ok[i]: Document(page_content=texts_ok[i], metadata=metas_ok[i])
+                                 for i in range(len(ids_ok))}
+                docstore = InMemoryDocstore(docstore_dict)
+                index_to_docstore_id = {i: ids_ok[i] for i in range(len(ids_ok))}
+
+                store = FAISS(
+                    embedding_function=embeddings,  # type: ignore
+                    index=index,
+                    docstore=docstore,
+                    index_to_docstore_id=index_to_docstore_id,
+                )
+
+        # 5) Lưu shard
         shard_dir = os.path.join(vector_dir, f"shard_{shard_idx:04d}")
         os.makedirs(shard_dir, exist_ok=True)
         store.save_local(shard_dir)
-
-        # Gợi ý log: có thể in ra dropped nếu cần
         if dropped:
             print(f"[WARN] Shard #{shard_idx}: dropped {dropped} empty/oversized chunks")
-        return len(tuples)
+        return len(texts_ok)
 
-    # Parse song song → ghi DuckDB theo lô → chunk → embed + lưu shard
+    # -------------------------
+    # Vòng lặp xử lý
+    # -------------------------
     for rec in parse_files_parallel(files, manual_type, max_workers=max_workers_parse):
+        # Ghi DuckDB theo lô
         m = TASK_PATTERN.search(rec["task_full"])
         aa_bb_cc = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
-        duckdb_rows.append((rec["task_full"], aa_bb_cc, rec["ata04"], rec["doc_type"], rec["title"], None, rec["source_file"]))
+        duckdb_rows.append((
+            rec["task_full"], aa_bb_cc, rec["ata04"], rec["doc_type"], rec["title"], None, rec["source_file"]
+        ))
         total_tasks += 1
         if len(duckdb_rows) >= 2000:
             flush_duckdb_rows(duckdb_rows)
 
-        # chunk
-        for i, ch in enumerate(splitter.split_text(rec["content"])):
+        # Chunk
+        for i, ch in enumerate(splitter.split_text(rec["content"] or "")):
             meta = {
-                "task_full": rec["task_full"], "ata04": rec["ata04"], "doc_type": rec["doc_type"],
-                "title": rec["title"], "source_file": rec["source_file"], "chunk_id": f"{rec['task_full']}#{i}"
+                "task_full": rec["task_full"],
+                "ata04": rec["ata04"],
+                "doc_type": rec["doc_type"],
+                "title": rec["title"],
+                "source_file": rec["source_file"],
+                "chunk_id": f"{rec['task_full']}#{i}",
             }
             shard_docs.append(Document(page_content=ch, metadata=meta))
             total_chunks += 1
 
-            # đủ 1 shard → embed & lưu
+            # Đủ 1 shard → embed & lưu
             if (not no_embed) and len(shard_docs) >= shard_size:
                 save_faiss_shard(shard_docs, shard_idx)
                 shard_docs.clear()
                 shard_idx += 1
 
+    # Flush phần còn lại
     flush_duckdb_rows(duckdb_rows)
     con.close()
 
