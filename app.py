@@ -136,34 +136,58 @@ if do_sync:
             # Heuristic nhận diện file: ATA map vs WO
             is_ata_map = (
                 any(re.search(r"ata.*0?4|^ata$|code", c) for c in cols)
-                and any(re.search(r"name|title|system|mô tả|description", c) for c in cols)
-            )
-            is_wo = (
-                any(re.search(r"w/?o.*desc|description|defect|symptom", c) for c in cols)
-                and any(re.search(r"w/?o.*action|rectification|action|repair|corrective", c) for c in cols)
+                and any(re.search(r"name|title|system|mô tả|mo ta|description", c) for c in cols)
             )
 
-            if is_ata_map:
+            # Mở rộng pattern tiếng Anh + tiếng Việt cho WO
+            desc_patterns = [
+                r"^W/?O\s*Description$", r"\b(description|defect|symptom)\b",
+                r"\bmô\s*tả\b", r"\bmo\s*ta\b",
+            ]
+            action_patterns = [
+                r"^W/?O\s*Action$", r"\b(rectification|action|repair|corrective|rectify)\b",
+                r"\bhành\s*động\b", r"\bhanh\s*dong\b", r"\bkhắc\s*phục\b", r"\bkhac\s*phuc\b",
+            ]
+            ata_final_patterns = [
+                r"\bATA\s*0?4\s*(Corrected|Final)\b", r"\bATA\s*final\b", r"\bATA04_Final\b",
+                r"\bATA\s*Corrected\b", r"\bATA\s*04\s*Corrected\b",
+            ]
+            ata_entered_patterns = [
+                r"^ATA$", r"\bATA\s*0?4\b", r"\bATA\s*04\b", r"\bATA04_Entered\b",
+                r"\bATA\s*Code\b", r"\bATA_Code\b",
+            ]
+
+            def find_col(pats):
+                for pat in pats:
+                    for c in df.columns:
+                        if re.search(pat, c, flags=re.I):
+                            return c
+                return None
+
+            is_wo = False
+            desc_col = find_col(desc_patterns)
+            act_col  = find_col(action_patterns)
+            ata_final_col   = find_col(ata_final_patterns)
+            ata_entered_col = find_col(ata_entered_patterns)
+
+            # Thư giãn điều kiện: coi là WO nếu có mô tả + (ATA_final hoặc ATA_entered).
+            # Cột action nếu có thì tốt; nếu không có vẫn ingest được.
+            if desc_col and (ata_final_col or ata_entered_col):
+                is_wo = True
+
+            if is_ata_map and not is_wo:
                 code_col = next((c for c in df.columns if re.search(r"ata.*0?4|^ata$|code", c, flags=re.I)), None)
-                name_col = next((c for c in df.columns if re.search(r"name|title|system|mô tả|description", c, flags=re.I)), None)
+                name_col = next((c for c in df.columns if re.search(r"name|title|system|mô tả|mo ta|description", c, flags=re.I)), None)
                 if code_col and name_col:
                     append_ata_map(df, code_col, name_col)
                     n_map += 1
             elif is_wo:
-                def find_col(pats):
-                    for pat in pats:
-                        for c in df.columns:
-                            if re.search(pat, c, flags=re.I):
-                                return c
-                    return None
-                desc_col = find_col([r"^W/?O\s*Description$", r"\b(description|defect|symptom)\b"])
-                act_col  = find_col([r"^W/?O\s*Action$", r"\b(rectification|action|repair|corrective)\b"])
-                ata_final_col   = find_col([r"\bATA\s*0?4\s*Corrected\b", r"\bATA\s*final\b", r"\bATA04_Final\b"])
-                ata_entered_col = find_col([r"^ATA$", r"\bATA\s*0?4\b", r"\bATA04_Entered\b"])
-
-                if desc_col and act_col and (ata_final_col or ata_entered_col):
-                    append_wo_training(df, desc_col, act_col, ata_final_col or "", ata_entered_col or "", p.name)
-                    n_wo += 1
+                # Nếu không có action, truyền "" để append_wo_training xử lý
+                append_wo_training(df, desc_col, act_col or "", ata_final_col or "", ata_entered_col or "", p.name)
+                n_wo += 1
+            else:
+                # Không phân loại được → show cột để người dùng biết
+                st.info(f"Không nhận diện được loại file: {p.name}. Một số cột đầu: {df.columns.tolist()[:12]}")
         except Exception as e:
             st.warning(f"Lỗi đọc {p.name}: {e}")
 
@@ -184,8 +208,12 @@ if do_sync:
     try:
         ensure_dirs()
         if not catalog_exists():
-            stat = build_catalog_from_memory()
-            st.success(f"Catalog chưa có → đã build mới từ bộ nhớ ({len(stat)} lớp).")
+            # Chỉ build khi đã có wo_training.parquet
+            if Path("data_store/wo_training.parquet").exists():
+                stat = build_catalog_from_memory()
+                st.success(f"Catalog chưa có → đã build mới từ bộ nhớ ({len(stat)} lớp).")
+            else:
+                st.warning("Không thể build catalog do chưa có data_store/wo_training.parquet.")
         else:
             st.info("Catalog đã tồn tại. Bạn có thể bấm 'Rebuild Catalog' nếu muốn cập nhật.")
     except Exception as e:
@@ -219,8 +247,12 @@ if uploaded is not None:
             # Nếu chưa có catalog, cố build từ bộ nhớ trước khi nạp
             if not catalog_exists():
                 ensure_dirs()
-                stat = build_catalog_from_memory()
-                st.info(f"Catalog chưa có → vừa build từ bộ nhớ ({len(stat)} lớp).")
+                if Path("data_store/wo_training.parquet").exists():
+                    stat = build_catalog_from_memory()
+                    st.info(f"Catalog chưa có → vừa build từ bộ nhớ ({len(stat)} lớp).")
+                else:
+                    st.error("Chưa có data_store/wo_training.parquet để build catalog. Hãy đồng bộ Drive chứa WO lịch sử.")
+                    st.stop()
             catalog = ATACatalog("catalog")
         except Exception as e:
             st.error(f"Không load được Catalog: {e}")
