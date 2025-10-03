@@ -22,9 +22,23 @@ st.set_page_config(page_title="WO → ATA04 Checker (Drive + Memory)", layout="w
 st.title("WO → ATA04 Checker (Drive + Incremental Memory)")
 init_db()
 
-# ---------------------------------------------------
-# Đọc Secrets (nếu có) và chuẩn bị biến mặc định
-# ---------------------------------------------------
+# ----------------------------
+# Tiện ích: kiểm tra/tạo catalog
+# ----------------------------
+CAT_JSON = Path("catalog/ata_catalog.json")
+CAT_VEC  = Path("catalog/model/tfidf_vectorizer.joblib")
+CAT_MAT  = Path("catalog/model/tfidf_matrix.npz")
+
+def catalog_exists() -> bool:
+    return CAT_JSON.exists() and CAT_VEC.exists() and CAT_MAT.exists()
+
+def ensure_dirs():
+    Path("catalog/model").mkdir(parents=True, exist_ok=True)
+    Path("data_store").mkdir(parents=True, exist_ok=True)
+
+# ----------------------------
+# Đọc Secrets (nếu có)
+# ----------------------------
 def _read_sa_json_from_secrets() -> bytes | None:
     """
     Tìm Service Account JSON trong st.secrets.
@@ -93,9 +107,10 @@ if do_sync:
     if not folder_id or not sa_json_bytes:
         st.error("Thiếu Folder ID hoặc Service Account JSON (secrets hoặc upload).")
         st.stop()
+
+    ensure_dirs()
     # Lưu SA JSON tạm
     sa_path = "data_store/sa.json"
-    Path("data_store").mkdir(parents=True, exist_ok=True)
     with open(sa_path, "wb") as f:
         f.write(sa_json_bytes)
 
@@ -154,11 +169,34 @@ if do_sync:
 
     st.info(f"Đã cập nhật bộ nhớ: {n_map} file ATA map, {n_wo} file WO.")
 
+    # Chẩn đoán nhanh sau đồng bộ
+    if Path("data_store/wo_training.parquet").exists():
+        st.success("Đã có data_store/wo_training.parquet (WO lịch sử).")
+    else:
+        st.warning("Chưa thấy wo_training.parquet. Kiểm tra lại định dạng cột WO để nhận diện đúng (Description/Action/ATA...).")
+
+    if Path("data_store/ata_map.parquet").exists():
+        st.success("Đã có data_store/ata_map.parquet (bảng ATA).")
+    else:
+        st.warning("Chưa thấy ata_map.parquet. Kiểm tra lại file định nghĩa ATA (phải có cột mã & tên).")
+
+    # Tự build catalog nếu chưa có
+    try:
+        ensure_dirs()
+        if not catalog_exists():
+            stat = build_catalog_from_memory()
+            st.success(f"Catalog chưa có → đã build mới từ bộ nhớ ({len(stat)} lớp).")
+        else:
+            st.info("Catalog đã tồn tại. Bạn có thể bấm 'Rebuild Catalog' nếu muốn cập nhật.")
+    except Exception as e:
+        st.warning(f"Không build được catalog sau đồng bộ: {e}")
+
 # ----------------------------
-# Build lại Catalog TF-IDF từ bộ nhớ
+# Build lại Catalog TF-IDF từ bộ nhớ (thủ công)
 # ----------------------------
 if do_rebuild:
     try:
+        ensure_dirs()
         stat = build_catalog_from_memory()
         st.success(f"Đã build Catalog từ bộ nhớ ({len(stat)} lớp).")
         st.dataframe(stat.head(30), use_container_width=True)
@@ -178,6 +216,11 @@ if uploaded is not None:
     catalog = None
     if use_catalog:
         try:
+            # Nếu chưa có catalog, cố build từ bộ nhớ trước khi nạp
+            if not catalog_exists():
+                ensure_dirs()
+                stat = build_catalog_from_memory()
+                st.info(f"Catalog chưa có → vừa build từ bộ nhớ ({len(stat)} lớp).")
             catalog = ATACatalog("catalog")
         except Exception as e:
             st.error(f"Không load được Catalog: {e}")
@@ -210,7 +253,7 @@ if uploaded is not None:
         # 3) E2: Catalog
         e2_best = None
         derived_task = derived_doc = derived_score = evidence_snip = evidence_src = None
-        if catalog and is_tech:
+        if use_catalog and catalog and is_tech:
             e2_best, _ = catalog.predict(defect, action)
             if e2_best:
                 derived_task = e2_best.get("ata04")
