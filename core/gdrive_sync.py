@@ -21,10 +21,13 @@ def _save_manifest(m: Dict):
     Path(MANIFEST).write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def _auth_service_account(sa_json_path: str):
-    gauth = GoogleAuth()
-    gauth.ServiceAuthCredentials = None
-    gauth.LoadServiceConfigSettings()
-    gauth.settings["service_config"]["client_json_file_path"] = sa_json_path
+    # Cấu hình pydrive2 với backend 'service' và chỉ rõ file json
+    gauth = GoogleAuth(settings={
+        "client_config_backend": "service",
+        "service_config": {
+            "client_json_file_path": sa_json_path
+        }
+    })
     gauth.ServiceAuth()
     return GoogleDrive(gauth)
 
