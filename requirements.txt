@@ -1,0 +1,15 @@
+streamlit>=1.37
+pandas>=2.2
+openpyxl>=3.1
+beautifulsoup4>=4.12
+lxml>=5.2
+regex>=2024.5.15
+scikit-learn>=1.5
+joblib>=1.4
+pyarrow>=16.1
+duckdb>=1.0
+faiss-cpu>=1.8 # optional (RAG – chưa bật)
+tiktoken>=0.7 # optional (RAG – chưa bật)
+pydrive2>=1.20
+google-auth>=2.33
+google-auth-oauthlib>=1.2
