@@ -187,26 +187,44 @@ def parse_files_parallel(file_paths: List[str], manual_type: str, max_workers: i
 
 
 # -------------------------
-# Token utils (tiktoken)
+# Token utils (SAFE, no encoding_for_model)
 # -------------------------
-def _tiktoken_len(text: str, model: str = "text-embedding-3-small") -> int:
+_MAX_CHARS_FALLBACK = 16000  # dùng khi không có tiktoken
+
+def _safe_get_encoder():
     try:
-        enc = tiktoken.encoding_for_model(model)
+        # Tránh dùng encoding_for_model; luôn chốt cl100k_base
+        return tiktoken.get_encoding("cl100k_base")
     except Exception:
-        enc = tiktoken.get_encoding("cl100k_base")
-    return len(enc.encode(text or ""))
+        return None
+
+def _tiktoken_len(text: str, model: str = "text-embedding-3-small") -> int:
+    if not text:
+        return 0
+    enc = _safe_get_encoder()
+    if enc is None:
+        # Fallback: đếm theo ký tự
+        return min(len(text), _MAX_CHARS_FALLBACK)
+    try:
+        return len(enc.encode(text))
+    except Exception:
+        return min(len(text), _MAX_CHARS_FALLBACK)
 
 def _clip_to_tokens(text: str, max_tokens: int, model: str = "text-embedding-3-small") -> str:
     if not text:
         return ""
+    enc = _safe_get_encoder()
+    if enc is None:
+        # Fallback: cắt theo ký tự gần tương đương
+        return text[:_MAX_CHARS_FALLBACK]
     try:
-        enc = tiktoken.encoding_for_model(model)
+        ids = enc.encode(text)
+        if len(ids) <= max_tokens:
+            return text
+        return enc.decode(ids[:max_tokens])
     except Exception:
-        enc = tiktoken.get_encoding("cl100k_base")
-    ids = enc.encode(text)
-    if len(ids) <= max_tokens:
-        return text
-    return enc.decode(ids[:max_tokens])
+        return text[:_MAX_CHARS_FALLBACK]
+
 
 
 # -------------------------
@@ -237,19 +255,38 @@ def build_registry_and_chunks(
     if not files:
         raise RuntimeError("Không tìm thấy file SGML/XML trong thư mục.")
 
-    # 1) DuckDB: tạo bảng nếu chưa có
-    con = duckdb.connect(duckdb_path)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS refs(
-            task_full TEXT,
-            task_short TEXT,
-            ata04 TEXT,
-            manual_type TEXT,
-            title TEXT,
-            page INTEGER,
-            source_file TEXT
-        )
-    """)
+ 
+# 1) DuckDB: tạo thư mục và kết nối bền (retry)
+db_dir = os.path.dirname(duckdb_path) or "."
+os.makedirs(db_dir, exist_ok=True)
+
+def _connect_duckdb(path, retries=3, delay=0.5):
+    last = None
+    for _ in range(retries):
+        try:
+            return duckdb.connect(path)
+        except Exception as e:
+            last = e
+            time.sleep(delay)
+    # Fallback: tạo DB tạm nếu đường dẫn hiện tại bị readonly/lock
+    tmp_db = os.path.join(tempfile.gettempdir(), "reference_index.duckdb")
+    try:
+        return duckdb.connect(tmp_db)
+    except Exception:
+        raise last or RuntimeError("Không thể kết nối DuckDB")
+
+con = _connect_duckdb(duckdb_path)
+con.execute("""
+    CREATE TABLE IF NOT EXISTS refs(
+        task_full TEXT,
+        task_short TEXT,
+        ata04 TEXT,
+        manual_type TEXT,
+        title TEXT,
+        page INTEGER,
+        source_file TEXT
+    )
+""")
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
