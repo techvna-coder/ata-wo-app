@@ -41,14 +41,23 @@ def append_ata_map(df_map: pd.DataFrame, code_col: str, name_col: str):
         out = df
     out.to_parquet(ATA_PARQUET, index=False)
 
-def append_wo_training(df_wo: pd.DataFrame, desc_col: str, act_col: str, ata_final_col: str, ata_entered_col: str, source_file: str):
+def append_wo_training(df_wo: pd.DataFrame, desc_col: str, act_col: str,
+                       ata_final_col: str, ata_entered_col: str, source_file: str):
+    from .cleaning import clean_wo_text  # import nội bộ để dùng chung
+
     tdf = df_wo.copy()
+
     def _text(row):
         parts = []
-        if desc_col in row and pd.notna(row[desc_col]): parts.append(str(row[desc_col]))
-        if act_col in row and pd.notna(row[act_col]): parts.append(str(row[act_col]))
-        return " | ".join(parts).strip()
+        if desc_col in row and pd.notna(row[desc_col]):
+            parts.append(clean_wo_text(str(row[desc_col])))
+        if act_col and act_col in row and pd.notna(row[act_col]):
+            parts.append(clean_wo_text(str(row[act_col])))
+        # ghép bằng ' | ' để giữ ngữ cảnh nhưng ổn định khi hash
+        return " | ".join([p for p in parts if p]).strip()
+
     tdf["text"] = tdf.apply(_text, axis=1)
+
     def _label(row):
         lab = None
         if ata_final_col in row and pd.notna(row[ata_final_col]) and str(row[ata_final_col]).strip():
@@ -56,16 +65,23 @@ def append_wo_training(df_wo: pd.DataFrame, desc_col: str, act_col: str, ata_fin
         elif ata_entered_col in row:
             lab = row[ata_entered_col]
         return _to_ata04(lab)
+
     tdf["ata04"] = tdf.apply(_label, axis=1)
-    tdf = tdf[(tdf["text"].str.len()>0) & tdf["ata04"].notna()].copy()
+
+    # bỏ dòng trống hoặc không chuẩn hoá được ATA04
+    tdf = tdf[(tdf["text"].str.len() > 0) & tdf["ata04"].notna()].copy()
+
+    # Hash sau khi làm sạch → chống trùng theo nội dung kỹ thuật thực
     tdf["hash"] = tdf["text"].map(_hash_text)
-    keep_cols = ["text","ata04","hash"]
+    keep_cols = ["text", "ata04", "hash"]
+
     if Path(WO_PARQUET).exists():
         old = pd.read_parquet(WO_PARQUET)
         merged = pd.concat([old[keep_cols], tdf[keep_cols]], ignore_index=True)
         merged = merged.drop_duplicates(subset=["hash"], keep="first")
     else:
         merged = tdf[keep_cols].drop_duplicates(subset=["hash"], keep="first")
+
     merged.to_parquet(WO_PARQUET, index=False)
     con = duckdb.connect(DB_PATH)
     con.execute("INSERT INTO wo_meta(source_file, rows_ingested) VALUES (?, ?)", [source_file, int(tdf.shape[0])])
