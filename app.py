@@ -386,13 +386,33 @@ if uploaded is not None:
         })
 
     res_df = pd.DataFrame(results)
-    df["ATA04_Final"] = res_df["ATA04_Final"]
-    view_cols = [c for c in ORDER_OUTCOLS if c in res_df.columns]
-    st.subheader("Kết quả")
-    st.dataframe(res_df[view_cols].head(200), use_container_width=True)
 
-    path = write_result(df, path="WO_ATA_checked.xlsx")
-    st.download_button("Tải kết quả Excel", data=open(path, "rb"), file_name="WO_ATA_checked.xlsx")
+    # Ghi kết quả vào đúng các cột mong muốn, bổ sung vào file gốc
+    # 1) Cột đích chuẩn của app (giữ nguyên để tương thích)
+    df["ATA04_Final"] = res_df["ATA04_Final"]
+
+    # 2) Bổ sung thêm đúng các cột bạn yêu cầu
+    df["Is_Technical_Defect"] = res_df["Is_Technical_Defect"]
+    df["ATA04_final"] = res_df["ATA04_Final"]           # tên cột theo yêu cầu (f thường)
+    df["Confidence"] = res_df["Confidence"]
+    df["Decision"] = res_df["Decision"]
+    df["Reason"] = res_df["Reason"]
+
+    # 3) Đồng thời điền vào cột gốc “ATA 04 Corrected” nếu file gốc có cột này (để tiện so sánh/audit)
+    if "ATA 04 Corrected" in df.columns:
+        df["ATA 04 Corrected"] = res_df["ATA04_Final"]
+
+    # Hiển thị tóm tắt kết quả trên màn hình
+    view_cols = ["Is_Technical_Defect", "ATA04_Final", "ATA04_final", "Confidence", "Decision", "Reason"]
+    view_cols = [c for c in view_cols if c in df.columns]
+    st.subheader("Kết quả")
+    st.dataframe(df[view_cols].head(200), use_container_width=True)
+
+    # Xuất file giữ nguyên dữ liệu gốc + cột bổ sung
+    from pathlib import Path
+    out_name = f"{Path(uploaded.name).stem}_ATA_checked.xlsx"
+    path = write_result(df, path=out_name)
+    st.download_button("Tải kết quả Excel", data=open(path, "rb"), file_name=out_name)
 
     if show_debug:
         st.write("Ví dụ citations:", citations_example[:3] if citations_example else None)
