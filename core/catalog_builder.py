@@ -1,4 +1,25 @@
 import json, re
+from joblib import dump
+import numpy as np
+
+
+WO_PARQUET = "data_store/wo_training.parquet"
+ATA_PARQUET = "data_store/ata_map.parquet"
+OUT_JSON = "catalog/ata_catalog.json"
+OUT_VEC = "catalog/model/tfidf_vectorizer.joblib"
+OUT_MAT = "catalog/model/tfidf_matrix.npz"
+
+
+def _normalize_text(s: str) -> str:
+s = (s or "").lower()
+s = re.sub(r"\s+", " ", s)
+return s.strip()
+
+
+def build_catalog_from_memory(min_docs_per_class=3, top_k=15, sample_k=3):
+Path("catalog/model").mkdir(parents=True, exist_ok=True)
+df = pd.read_parquet(WO_PARQUET)
+df["text_norm"] = df["text"].astype(str).map(_normalize_text)
 classes = sorted(df["ata04"].unique())
 
 
