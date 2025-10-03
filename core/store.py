@@ -41,6 +41,7 @@ def append_ata_map(df_map: pd.DataFrame, code_col: str, name_col: str):
         out = df
     out.to_parquet(ATA_PARQUET, index=False)
 
+# core/store.py (chỉ thay hàm append_wo_training)
 def append_wo_training(df_wo: pd.DataFrame, desc_col: str, act_col: str,
                        ata_final_col: str, ata_entered_col: str, source_file: str):
     from .cleaning import clean_wo_text  # import nội bộ để dùng chung
