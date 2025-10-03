@@ -10,9 +10,10 @@ regex
 tqdm
 python-dotenv
 rapidfuzz
-
 # LangChain tách gói từ 2024 ⇒ cần đồng bộ phiên bản
 langchain>=0.2.10
 langchain-core>=0.2.10
 langchain-openai>=0.1.7
 langchain-community>=0.2.10
+scikit-learn
+joblib
