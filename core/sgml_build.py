@@ -1,5 +1,5 @@
 # core/sgml_build.py
-import os, tarfile, re, json, shutil, uuid, time
+import os, tarfile, re, shutil, time
 from pathlib import Path
 from typing import Iterator, Dict, List, Tuple, Optional, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 import duckdb
+import tiktoken
 
 # Fallback Document
 try:
@@ -21,6 +22,12 @@ except Exception:
     from langchain.embeddings import OpenAIEmbeddings  # fallback
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# Fallback FAISS
+try:
+    from langchain_community.vectorstores import FAISS
+except Exception:
+    from langchain.vectorstores import FAISS  # fallback
 
 TASK_PATTERN = re.compile(r'\b(\d{2})-(\d{2})-(\d{2})(?:-(\d{3})(?:-(\d{3}))*)?\b')
 TASK_COMPACT = re.compile(r'\b(\d{2})(\d{2})(\d{2})(?:(\d{3}))?(?:(\d{3}))?\b')
@@ -65,7 +72,7 @@ def _get_text(node) -> str:
 def parse_one_sgml(path: str, manual_type: str) -> List[Dict]:
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         data = f.read()
-    # Parsers: thử lxml trước, nếu “khó” có thể đổi thành html.parser
+    # Thử lxml trước; nếu cần có thể đổi "html.parser" cho 1 số OEM đặc thù
     soup = BeautifulSoup(data, "lxml")
 
     records: List[Dict] = []
@@ -107,7 +114,7 @@ def parse_one_sgml(path: str, manual_type: str) -> List[Dict]:
                 "content": content
             })
     else:
-        # Fallback: quét bằng regex toàn file
+        # Fallback: regex toàn file
         for m in TASK_PATTERN.finditer(data):
             task_full = _norm_task_code(m.group(0))
             if not task_full: 
@@ -139,6 +146,28 @@ def parse_files_parallel(file_paths: List[str], manual_type: str, max_workers: i
             for r in recs:
                 yield r
 
+# --------- Token utils ----------
+def _tiktoken_len(text: str, model: str = "text-embedding-3-small") -> int:
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except Exception:
+        enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(text or ""))
+
+def _clip_to_tokens(text: str, max_tokens: int, model: str = "text-embedding-3-small") -> str:
+    if not text:
+        return ""
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except Exception:
+        enc = tiktoken.get_encoding("cl100k_base")
+    ids = enc.encode(text)
+    if len(ids) <= max_tokens:
+        return text
+    return enc.decode(ids[:max_tokens])
+
+# ---------------------------------
+
 def build_registry_and_chunks(
     extracted_dir: str,
     manual_type: str,
@@ -153,14 +182,9 @@ def build_registry_and_chunks(
     max_workers_parse: int = 4,
     no_embed: bool = False,
     resume: bool = False,
+    # Giới hạn an toàn cho mỗi item khi gọi embeddings (tối đa per-request 8192 token cho t-e-3-*)
+    per_item_token_max: int = 7900,
 ) -> Tuple[int, int]:
-
-    from math import inf
-    # Fallback FAISS import
-    try:
-        from langchain_community.vectorstores import FAISS
-    except Exception:
-        from langchain.vectorstores import FAISS  # fallback
 
     files = list(iter_sgml_files(extracted_dir))
     if not files:
@@ -202,16 +226,80 @@ def build_registry_and_chunks(
         con.executemany("INSERT INTO refs VALUES (?,?,?,?,?,?,?)", rows)
         rows.clear()
 
+    def _embed_texts_with_retry(texts: List[str]) -> List[List[float]]:
+        # Loại bỏ None, chuẩn hoá, cắt token & bỏ rỗng
+        clean_texts = []
+        idx_map = []  # map từ clean_texts index -> texts index
+        skipped = 0
+        for i, t in enumerate(texts):
+            t = (t or "").strip()
+            if not t:
+                skipped += 1
+                continue
+            if _tiktoken_len(t, embedding_model) > per_item_token_max:
+                t = _clip_to_tokens(t, per_item_token_max, embedding_model)
+            if not t:
+                skipped += 1
+                continue
+            clean_texts.append(t)
+            idx_map.append(i)
+        if not clean_texts:
+            return [None] * len(texts)
+
+        # Batch + retry + backoff
+        vecs_all: List[List[float]] = [None] * len(texts)
+        start = 0
+        while start < len(clean_texts):
+            batch = clean_texts[start:start+embed_batch_size]
+            for attempt in range(6):
+                try:
+                    vecs = embeddings.embed_documents(batch)
+                    break
+                except Exception as e:
+                    # backoff luỹ thừa 1s,2s,4s,8s,16s,32s
+                    time.sleep(1.0 * (2 ** attempt))
+                    if attempt == 5:
+                        raise
+            for j, v in enumerate(vecs):
+                vecs_all[idx_map[start+j]] = v
+            start += embed_batch_size
+        return vecs_all
+
     def save_faiss_shard(shard_docs: List[Document], shard_idx: int):
         if not shard_docs:
             return 0
-        store = FAISS.from_documents(shard_docs, embeddings)
+        # Chuẩn bị texts & metadatas
+        texts = [d.page_content for d in shard_docs]
+        metas = [d.metadata for d in shard_docs]
+
+        # Tính embedding với kiểm soát chặt chẽ
+        vecs = _embed_texts_with_retry(texts)
+
+        # Lọc bỏ phần tử lỗi hoặc None
+        tuples = []
+        dropped = 0
+        for v, d in zip(vecs, shard_docs):
+            if v is None:
+                dropped += 1
+                continue
+            tuples.append((v, d))
+
+        if not tuples:
+            return 0
+
+        # Tạo store từ embedding trực tiếp
+        store = FAISS.from_embeddings(tuples)
+
         shard_dir = os.path.join(vector_dir, f"shard_{shard_idx:04d}")
         os.makedirs(shard_dir, exist_ok=True)
         store.save_local(shard_dir)
-        return len(shard_docs)
 
-    # Parse song song → ghi DuckDB theo lô → chunk → nhúng thành shard
+        # Gợi ý log: có thể in ra dropped nếu cần
+        if dropped:
+            print(f"[WARN] Shard #{shard_idx}: dropped {dropped} empty/oversized chunks")
+        return len(tuples)
+
+    # Parse song song → ghi DuckDB theo lô → chunk → embed + lưu shard
     for rec in parse_files_parallel(files, manual_type, max_workers=max_workers_parse):
         m = TASK_PATTERN.search(rec["task_full"])
         aa_bb_cc = f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
@@ -220,6 +308,7 @@ def build_registry_and_chunks(
         if len(duckdb_rows) >= 2000:
             flush_duckdb_rows(duckdb_rows)
 
+        # chunk
         for i, ch in enumerate(splitter.split_text(rec["content"])):
             meta = {
                 "task_full": rec["task_full"], "ata04": rec["ata04"], "doc_type": rec["doc_type"],
@@ -228,6 +317,7 @@ def build_registry_and_chunks(
             shard_docs.append(Document(page_content=ch, metadata=meta))
             total_chunks += 1
 
+            # đủ 1 shard → embed & lưu
             if (not no_embed) and len(shard_docs) >= shard_size:
                 save_faiss_shard(shard_docs, shard_idx)
                 shard_docs.clear()
