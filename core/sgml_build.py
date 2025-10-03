@@ -13,6 +13,7 @@ import re
 import tarfile
 import time
 import shutil
+import tempfile  # <- cần cho kết nối DuckDB fallback
 from pathlib import Path
 from typing import Iterator, Dict, List, Tuple, Optional, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -226,7 +227,6 @@ def _clip_to_tokens(text: str, max_tokens: int, model: str = "text-embedding-3-s
         return text[:_MAX_CHARS_FALLBACK]
 
 
-
 # -------------------------
 # Build pipeline chính
 # -------------------------
@@ -255,38 +255,37 @@ def build_registry_and_chunks(
     if not files:
         raise RuntimeError("Không tìm thấy file SGML/XML trong thư mục.")
 
- 
-# 1) DuckDB: tạo thư mục và kết nối bền (retry)
-db_dir = os.path.dirname(duckdb_path) or "."
-os.makedirs(db_dir, exist_ok=True)
+    # 1) DuckDB: tạo thư mục và kết nối bền (retry)  ← **đặt trong thân hàm, đúng thụt lề**
+    db_dir = os.path.dirname(duckdb_path) or "."
+    os.makedirs(db_dir, exist_ok=True)
 
-def _connect_duckdb(path, retries=3, delay=0.5):
-    last = None
-    for _ in range(retries):
+    def _connect_duckdb(path, retries=3, delay=0.5):
+        last = None
+        for _ in range(retries):
+            try:
+                return duckdb.connect(path)
+            except Exception as e:
+                last = e
+                time.sleep(delay)
+        # Fallback: tạo DB tạm nếu đường dẫn hiện tại bị readonly/lock
+        tmp_db = os.path.join(tempfile.gettempdir(), "reference_index.duckdb")
         try:
-            return duckdb.connect(path)
-        except Exception as e:
-            last = e
-            time.sleep(delay)
-    # Fallback: tạo DB tạm nếu đường dẫn hiện tại bị readonly/lock
-    tmp_db = os.path.join(tempfile.gettempdir(), "reference_index.duckdb")
-    try:
-        return duckdb.connect(tmp_db)
-    except Exception:
-        raise last or RuntimeError("Không thể kết nối DuckDB")
+            return duckdb.connect(tmp_db)
+        except Exception:
+            raise last or RuntimeError("Không thể kết nối DuckDB")
 
-con = _connect_duckdb(duckdb_path)
-con.execute("""
-    CREATE TABLE IF NOT EXISTS refs(
-        task_full TEXT,
-        task_short TEXT,
-        ata04 TEXT,
-        manual_type TEXT,
-        title TEXT,
-        page INTEGER,
-        source_file TEXT
-    )
-""")
+    con = _connect_duckdb(duckdb_path)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS refs(
+            task_full TEXT,
+            task_short TEXT,
+            ata04 TEXT,
+            manual_type TEXT,
+            title TEXT,
+            page INTEGER,
+            source_file TEXT
+        )
+    """)
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
@@ -320,16 +319,13 @@ con.execute("""
 
         clean_texts = []
         idx_map = []
-        skipped = 0
         for i, t in enumerate(texts):
             t = (t or "").strip()
             if not t:
-                skipped += 1
                 continue
             if _tiktoken_len(t, embedding_model) > per_item_token_max:
                 t = _clip_to_tokens(t, per_item_token_max, embedding_model)
             if not t:
-                skipped += 1
                 continue
             clean_texts.append(t)
             idx_map.append(i)
