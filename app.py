@@ -402,7 +402,7 @@ if uploaded is not None:
         df["ATA 04 Corrected"] = res_df["ATA04_Final"]
 
     # Hiển thị tóm tắt kết quả trên màn hình
-    view_cols = ["Is_Technical_Defect","Defect_Text","Rectification_Text", "ATA04_Final", "ATA04_final", "Confidence", "Decision", "Reason"]
+    view_cols = ["Is_Technical_Defect","Defect_Text","Rectification_Text", "ATA04_Entered","ATA04_Final", "ATA04_final", "Confidence", "Decision", "Reason"]
     view_cols = [c for c in view_cols if c in df.columns]
     st.subheader("Kết quả")
     st.dataframe(df[view_cols].head(200), use_container_width=True)
