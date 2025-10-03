@@ -14,7 +14,7 @@ from core.refs import extract_citations
 from core.ata_catalog import ATACatalog
 from core.decision import decide
 from core.mapping import ORDER_OUTCOLS
-
+from core.audit import audit_store, list_ingested_files, classify_all_ingested
 # ----------------------------
 # Cấu hình trang
 # ----------------------------
@@ -99,6 +99,9 @@ with st.sidebar:
     do_rebuild = st.button("Rebuild Catalog từ bộ nhớ")
     use_catalog = st.checkbox("Dùng Catalog (TF-IDF)", value=True)
     show_debug = st.checkbox("Hiển thị debug", value=False)
+    
+    st.markdown("---")
+    do_audit = st.button("Kiểm tra dữ liệu đã đồng bộ (Audit)")
 
 # ----------------------------
 # Đồng bộ & ingest dữ liệu
