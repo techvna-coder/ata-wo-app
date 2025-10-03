@@ -1,8 +1,9 @@
 import os
-import streamlit as st
-import pandas as pd
-from pathlib import Path
 import re
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
 
 from core.gdrive_sync import sync_drive_folder
 from core.store import init_db, append_wo_training, append_ata_map
@@ -14,69 +15,148 @@ from core.ata_catalog import ATACatalog
 from core.decision import decide
 from core.mapping import ORDER_OUTCOLS
 
+# ----------------------------
+# Cấu hình trang
+# ----------------------------
 st.set_page_config(page_title="WO → ATA04 Checker (Drive + Memory)", layout="wide")
 st.title("WO → ATA04 Checker (Drive + Incremental Memory)")
 init_db()
 
+# ---------------------------------------------------
+# Đọc Secrets (nếu có) và chuẩn bị biến mặc định
+# ---------------------------------------------------
+def _read_sa_json_from_secrets() -> bytes | None:
+    """
+    Tìm Service Account JSON trong st.secrets.
+    Hỗ trợ cả dạng string (JSON text) lẫn dict (object).
+    """
+    candidates = [
+        "GDRIVE_SERVICE_ACCOUNT_JSON",
+        "SERVICE_ACCOUNT_JSON",
+        "gdrive_service_account",
+        "service_account",
+    ]
+    for k in candidates:
+        if k in st.secrets:
+            val = st.secrets[k]
+            if isinstance(val, str):
+                return val.encode("utf-8")
+            elif isinstance(val, dict):
+                import json
+                return json.dumps(val).encode("utf-8")
+    return None
+
+def _default_folder_from_secrets() -> str | None:
+    for k in ("GDRIVE_FOLDER_ID", "DRIVE_FOLDER_ID"):
+        if k in st.secrets:
+            return st.secrets[k]
+    return None
+
+# Xuất OPENAI_API_KEY vào env (nếu có trong secrets)
+if "OPENAI_API_KEY" in st.secrets and not os.environ.get("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+
+default_folder_id = _default_folder_from_secrets()
+default_sa_json_bytes = _read_sa_json_from_secrets()
+
+# ----------------------------
+# Sidebar: Kết nối Google Drive
+# ----------------------------
 with st.sidebar:
     st.header("Kết nối Google Drive")
-    folder_id = st.text_input("Drive Folder ID", value="", help="URL dạng drive.google.com/drive/folders/<FOLDER_ID>")
-    sa_json = st.file_uploader("Service Account JSON", type=["json"], help="Upload khoá service account")
+
+    folder_id = st.text_input(
+        "Drive Folder ID",
+        value=default_folder_id or "",
+        help="URL dạng drive.google.com/drive/folders/<FOLDER_ID> (chỉ cần phần <FOLDER_ID>)"
+    )
+
+    sa_json_upload = st.file_uploader(
+        "Service Account JSON (bỏ qua nếu đã cài trong Secrets)",
+        type=["json"]
+    )
+    sa_json_bytes = default_sa_json_bytes
+    if not sa_json_bytes and sa_json_upload:
+        sa_json_bytes = sa_json_upload.read()
+
     do_sync = st.button("Đồng bộ từ Drive (incremental)")
+
     st.markdown("---")
     do_rebuild = st.button("Rebuild Catalog từ bộ nhớ")
     use_catalog = st.checkbox("Dùng Catalog (TF-IDF)", value=True)
     show_debug = st.checkbox("Hiển thị debug", value=False)
 
+# ----------------------------
+# Đồng bộ & ingest dữ liệu
+# ----------------------------
 if do_sync:
-    if not folder_id or not sa_json:
-        st.error("Thiếu Folder ID hoặc Service Account JSON.")
-    else:
-        sa_path = "data_store/sa.json"
-        Path("data_store").mkdir(parents=True, exist_ok=True)
-        with open(sa_path, "wb") as f:
-            f.write(sa_json.read())
+    if not folder_id or not sa_json_bytes:
+        st.error("Thiếu Folder ID hoặc Service Account JSON (secrets hoặc upload).")
+        st.stop()
+    # Lưu SA JSON tạm
+    sa_path = "data_store/sa.json"
+    Path("data_store").mkdir(parents=True, exist_ok=True)
+    with open(sa_path, "wb") as f:
+        f.write(sa_json_bytes)
+
+    # Gọi đồng bộ (bọc lỗi để hiển thị rõ ràng)
+    try:
         changed = sync_drive_folder(folder_id, sa_path)
-        st.success(f"Đồng bộ xong. {len(changed)} file mới/cập nhật.")
+    except Exception as e:
+        st.error(f"Lỗi xác thực hoặc truy cập Drive: {e}")
+        st.stop()
 
-        # Ingest về bộ nhớ
-        inj_dir = Path("data_store/ingest")
-        files = sorted([p for p in inj_dir.glob("*.xls*")])
-        n_map, n_wo = 0, 0
+    st.success(f"Đồng bộ xong. {len(changed)} file mới/cập nhật.")
 
-        for p in files:
-            try:
-                df = pd.read_excel(p, dtype=str)
-                cols = [c.lower() for c in df.columns]
-                is_ata_map = any(re.search(r"ata.*0?4|^ata$|code", c) for c in cols) and any(re.search(r"name|title|system|mô tả|description", c) for c in cols)
-                is_wo = any(re.search(r"w/?o.*desc|description|defect", c) for c in cols) and any(re.search(r"w/?o.*action|rectification|action", c) for c in cols)
+    # Ingest → memory (phân loại file ATA map / WO)
+    inj_dir = Path("data_store/ingest")
+    files = sorted([p for p in inj_dir.glob("*.xls*")])
+    n_map, n_wo = 0, 0
 
-                if is_ata_map:
-                    code_col = [c for c in df.columns if re.search(r"ata.*0?4|^ata$|code", c, flags=re.I)]
-                    name_col = [c for c in df.columns if re.search(r"name|title|system|mô tả|description", c, flags=re.I)]
-                    if code_col and name_col:
-                        append_ata_map(df, code_col[0], name_col[0])
-                        n_map += 1
-                elif is_wo:
-                    def find_col(pats):
-                        for pat in pats:
-                            for c in df.columns:
-                                if re.search(pat, c, flags=re.I):
-                                    return c
-                        return None
-                    desc_col = find_col([r"^W/?O\s*Description$", r"\b(description|defect|symptom)\b"])
-                    act_col  = find_col([r"^W/?O\s*Action$", r"\b(rectification|action|repair|corrective)\b"])
-                    ata_final_col = find_col([r"\bATA\s*0?4\s*Corrected\b", r"\bATA\s*final\b", r"\bATA04_Final\b"])
-                    ata_entered_col = find_col([r"^ATA$", r"\bATA\s*0?4\b", r"\bATA04_Entered\b"])
+    for p in files:
+        try:
+            df = pd.read_excel(p, dtype=str)
+            cols = [c.lower() for c in df.columns]
 
-                    if desc_col and act_col and (ata_final_col or ata_entered_col):
-                        append_wo_training(df, desc_col, act_col, ata_final_col or "", ata_entered_col or "", p.name)
-                        n_wo += 1
-            except Exception as e:
-                st.warning(f"Lỗi đọc {p.name}: {e}")
+            # Heuristic nhận diện file: ATA map vs WO
+            is_ata_map = (
+                any(re.search(r"ata.*0?4|^ata$|code", c) for c in cols)
+                and any(re.search(r"name|title|system|mô tả|description", c) for c in cols)
+            )
+            is_wo = (
+                any(re.search(r"w/?o.*desc|description|defect|symptom", c) for c in cols)
+                and any(re.search(r"w/?o.*action|rectification|action|repair|corrective", c) for c in cols)
+            )
 
-        st.info(f"Đã cập nhật bộ nhớ: {n_map} file ATA map, {n_wo} file WO.")
+            if is_ata_map:
+                code_col = next((c for c in df.columns if re.search(r"ata.*0?4|^ata$|code", c, flags=re.I)), None)
+                name_col = next((c for c in df.columns if re.search(r"name|title|system|mô tả|description", c, flags=re.I)), None)
+                if code_col and name_col:
+                    append_ata_map(df, code_col, name_col)
+                    n_map += 1
+            elif is_wo:
+                def find_col(pats):
+                    for pat in pats:
+                        for c in df.columns:
+                            if re.search(pat, c, flags=re.I):
+                                return c
+                    return None
+                desc_col = find_col([r"^W/?O\s*Description$", r"\b(description|defect|symptom)\b"])
+                act_col  = find_col([r"^W/?O\s*Action$", r"\b(rectification|action|repair|corrective)\b"])
+                ata_final_col   = find_col([r"\bATA\s*0?4\s*Corrected\b", r"\bATA\s*final\b", r"\bATA04_Final\b"])
+                ata_entered_col = find_col([r"^ATA$", r"\bATA\s*0?4\b", r"\bATA04_Entered\b"])
 
+                if desc_col and act_col and (ata_final_col or ata_entered_col):
+                    append_wo_training(df, desc_col, act_col, ata_final_col or "", ata_entered_col or "", p.name)
+                    n_wo += 1
+        except Exception as e:
+            st.warning(f"Lỗi đọc {p.name}: {e}")
+
+    st.info(f"Đã cập nhật bộ nhớ: {n_map} file ATA map, {n_wo} file WO.")
+
+# ----------------------------
+# Build lại Catalog TF-IDF từ bộ nhớ
+# ----------------------------
 if do_rebuild:
     try:
         stat = build_catalog_from_memory()
@@ -85,11 +165,17 @@ if do_rebuild:
     except Exception as e:
         st.error(f"Lỗi build catalog: {e}")
 
+# ----------------------------
+# Xử lý WO mới (upload thủ công)
+# ----------------------------
 st.header("Xử lý WO mới")
-uploaded = st.file_uploader("Upload Excel WO cần suy luận ATA corrected", type=["xlsx","xls"])
+uploaded = st.file_uploader("Upload Excel WO cần suy luận ATA corrected", type=["xlsx", "xls"])
+
 if uploaded is not None:
     df = load_wo_excel(uploaded)
     st.success(f"Đã nạp {len(df)} dòng.")
+
+    catalog = None
     if use_catalog:
         try:
             catalog = ATACatalog("catalog")
@@ -105,11 +191,13 @@ if uploaded is not None:
         action = row.get("Rectification_Text")
         e0 = row.get("ATA04_Entered")
 
+        # 1) Non-Defect filter
         is_tech = is_technical_defect(defect, action)
 
+        # 2) E1: citations
         citations = extract_citations(f"{defect or ''} {action or ''}")
         if citations and citations_example is None:
-            citations_example = citations
+            citations_example = citations[:]
         e1_valid, e1_ata, cited_manual, cited_task = False, None, None, None
         for c in citations:
             if c.get("ata04"):
@@ -119,9 +207,10 @@ if uploaded is not None:
                 cited_task = c["task"]
                 break
 
+        # 3) E2: Catalog
         e2_best = None
         derived_task = derived_doc = derived_score = evidence_snip = evidence_src = None
-        if use_catalog and is_tech:
+        if catalog and is_tech:
             e2_best, _ = catalog.predict(defect, action)
             if e2_best:
                 derived_task = e2_best.get("ata04")
@@ -130,14 +219,15 @@ if uploaded is not None:
                 evidence_snip= e2_best.get("snippet")
                 evidence_src = e2_best.get("source")
 
+        # 4) Decision
         decision, conf, reason = decide(
-            e0=(e0 if isinstance(e0,str) and len(e0)>=5 else None),
+            e0=(e0 if isinstance(e0, str) and len(e0) >= 5 else None),
             e1_valid=(is_tech and e1_valid),
             e1_ata=e1_ata,
             e2_best=e2_best,
             e2_all=None
         )
-        ata_final = (e1_ata or derived_task or e0) if decision in ("CONFIRM","CORRECT") else (derived_task or e1_ata or e0)
+        ata_final = (e1_ata or derived_task or e0) if decision in ("CONFIRM", "CORRECT") else (derived_task or e1_ata or e0)
 
         results.append({
             "Is_Technical_Defect": bool(is_tech),
