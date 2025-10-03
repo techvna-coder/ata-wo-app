@@ -235,6 +235,65 @@ if do_rebuild:
         st.error(f"Lỗi build catalog: {e}")
 
 # ----------------------------
+# KIỂM TRA DỮ LIỆU ĐÃ ĐỒNG BỘ (AUDIT)
+# ----------------------------
+if do_audit:
+    st.header("Kiểm tra dữ liệu đã đồng bộ (Audit)")
+
+    # 1) Liệt kê file đã sync
+    files = list_ingested_files()
+    st.subheader("Danh sách file đã đồng bộ (manifest)")
+    if files:
+        df_files = pd.DataFrame(files)
+        st.dataframe(df_files[["name","path","modified"]], use_container_width=True)
+    else:
+        st.info("Chưa có manifest hoặc chưa sync file nào.")
+
+    # 2) Phân loại nhanh các file trong ingest
+    st.subheader("Phân loại file trong data_store/ingest/")
+    classified = classify_all_ingested(limit_preview_rows=5)
+    for item in classified:
+        st.write(f"**{item.get('path')}** → kind: `{item.get('kind')}`")
+        if item.get("kind") == "WO":
+            st.write(f"- desc_col: `{item.get('desc_col')}`, action_col: `{item.get('action_col')}`, "
+                     f"ata_final_col: `{item.get('ata_final_col')}`, ata_entered_col: `{item.get('ata_entered_col')}`")
+            if "preview" in item and isinstance(item["preview"], pd.DataFrame):
+                st.dataframe(item["preview"], use_container_width=True)
+        elif item.get("kind") == "ATA_MAP":
+            st.write("- Phát hiện là bảng ATA (mã + tên).")
+        elif item.get("kind") == "error":
+            st.warning(f"- Lỗi đọc: {item.get('error')}")
+        else:
+            st.info("- Không nhận diện được loại file. Hãy xem lại tên cột.")
+
+    # 3) Tổng hợp store (parquet)
+    st.subheader("Tổng hợp bộ nhớ (Parquet)")
+    rep = audit_store()
+
+    # WO training
+    wo_rep = rep.get("wo_training", {})
+    if wo_rep.get("exists"):
+        st.success(f"wo_training.parquet: {wo_rep['rows']} dòng, {wo_rep['distinct_ata04']} ATA04 khác nhau.")
+        st.write("Top 20 ATA04 theo số mẫu:")
+        st.dataframe(wo_rep["top_ata"], use_container_width=True)
+        st.write("Mẫu dữ liệu:")
+        st.dataframe(wo_rep["sample"], use_container_width=True)
+    else:
+        st.warning("Chưa có data_store/wo_training.parquet.")
+
+    # ATA map
+    ata_rep = rep.get("ata_map", {})
+    if ata_rep.get("exists"):
+        st.success(f"ata_map.parquet: {ata_rep['rows']} dòng.")
+        if "coverage_on_training" in ata_rep:
+            st.info(f"Độ phủ tên gọi ATA trên training: {ata_rep['coverage_on_training']}%")
+        st.write("Mẫu dữ liệu:")
+        st.dataframe(ata_rep["sample"], use_container_width=True)
+    else:
+        st.warning("Chưa có data_store/ata_map.parquet.")
+
+
+# ----------------------------
 # Xử lý WO mới (upload thủ công)
 # ----------------------------
 st.header("Xử lý WO mới")
