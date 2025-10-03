@@ -47,6 +47,8 @@ def list_folder_files(drive: GoogleDrive, folder_id: str):
 def sync_drive_folder(folder_id: str, sa_json_path: str) -> List[str]:
     """
     Đồng bộ incremental 1 thư mục Drive về data_store/ingest.
+    - Tự export Google Sheets thành .xlsx
+    - Chỉ nhận file Excel (.xlsx/.xls)
     Trả về danh sách file path đã được tải/cập nhật.
     """
     _ensure_dirs()
@@ -74,24 +76,40 @@ def sync_drive_folder(folder_id: str, sa_json_path: str) -> List[str]:
         # Bỏ qua thư mục con
         if mime == "application/vnd.google-apps.folder":
             continue
-        # Chỉ nhận Excel
-        if not re.search(r"\.(xlsx|xls)$", name, flags=re.I):
+
+        # Google Sheets → export .xlsx
+        if mime == "application/vnd.google-apps.spreadsheet":
+            # tên file local đảm bảo có .xlsx
+            local_path = str(Path(INGEST_DIR) / (name if name.lower().endswith(".xlsx") else f"{name}.xlsx"))
+            rec = by_id.get(fid, {})
+            if rec.get("modified") == modified and rec.get("name") == name:
+                continue
+            try:
+                gfile = drive.CreateFile({"id": fid})
+                gfile.GetContentFile(
+                    local_path,
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            except Exception as e:
+                raise RuntimeError(f"Export Google Sheet '{name}' lỗi: {e}")
+            by_id[fid] = {"name": name, "modified": modified, "path": local_path}
+            changed_paths.append(local_path)
             continue
 
-        rec = by_id.get(fid, {})
-        if rec.get("modified") == modified and rec.get("name") == name:
-            # Không thay đổi
-            continue
-
-        local_path = str(Path(INGEST_DIR) / name)
-        try:
-            gfile = drive.CreateFile({"id": fid})
-            gfile.GetContentFile(local_path)
-        except Exception as e:
-            raise RuntimeError(f"Tải file '{name}' lỗi: {e}")
-
-        by_id[fid] = {"name": name, "modified": modified, "path": local_path}
-        changed_paths.append(local_path)
+        # File Excel chuẩn tải trực tiếp
+        if re.search(r"\.(xlsx|xls)$", name, flags=re.I):
+            rec = by_id.get(fid, {})
+            if rec.get("modified") == modified and rec.get("name") == name:
+                continue
+            local_path = str(Path(INGEST_DIR) / name)
+            try:
+                gfile = drive.CreateFile({"id": fid})
+                gfile.GetContentFile(local_path)
+            except Exception as e:
+                raise RuntimeError(f"Tải file '{name}' lỗi: {e}")
+            by_id[fid] = {"name": name, "modified": modified, "path": local_path}
+            changed_paths.append(local_path)
+        # Bỏ qua các loại file khác
 
     manifest["by_id"] = by_id
     _save_manifest(manifest)
