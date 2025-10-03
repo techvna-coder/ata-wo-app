@@ -389,8 +389,6 @@ if uploaded is not None:
 
     # Ghi kết quả vào đúng các cột mong muốn, bổ sung vào file gốc
     # 1) Cột đích chuẩn của app (giữ nguyên để tương thích)
-    df["ATA04_Final"] = res_df["ATA04_Final"]
-
     # 2) Bổ sung thêm đúng các cột bạn yêu cầu
     df["Is_Technical_Defect"] = res_df["Is_Technical_Defect"]
     df["ATA04_final"] = res_df["ATA04_Final"]           # tên cột theo yêu cầu (f thường)
