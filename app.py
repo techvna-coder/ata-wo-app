@@ -1,5 +1,10 @@
+# app.py
 import os
 import re
+import io
+import json
+import glob
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -62,24 +67,26 @@ def _read_sa_json_from_secrets() -> bytes | None:
         "gdrive_service_account",
         "service_account",
     ]
-    for k in candidates:
-        if k in st.secrets:
-            val = st.secrets[k]
-            if isinstance(val, str):
-                return val.encode("utf-8")
-            elif isinstance(val, dict):
-                import json
-                return json.dumps(val).encode("utf-8")
+    if hasattr(st, "secrets"):
+        for k in candidates:
+            if k in st.secrets:
+                val = st.secrets[k]
+                if isinstance(val, str):
+                    return val.encode("utf-8")
+                elif isinstance(val, dict):
+                    import json as _json
+                    return _json.dumps(val).encode("utf-8")
     return None
 
 def _default_folder_from_secrets() -> str | None:
-    for k in ("GDRIVE_FOLDER_ID", "DRIVE_FOLDER_ID"):
-        if k in st.secrets:
-            return st.secrets[k]
+    if hasattr(st, "secrets"):
+        for k in ("GDRIVE_FOLDER_ID", "DRIVE_FOLDER_ID"):
+            if k in st.secrets:
+                return st.secrets[k]
     return None
 
 # Xuất OPENAI_API_KEY vào env (nếu có trong secrets)
-if "OPENAI_API_KEY" in st.secrets and not os.environ.get("OPENAI_API_KEY"):
+if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets and not os.environ.get("OPENAI_API_KEY"):
     os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
 
 default_folder_id = _default_folder_from_secrets()
@@ -222,8 +229,6 @@ if do_sync:
         st.success("Đã có data_store/ata_map.parquet (bảng ATA).")
     else:
         st.warning("Chưa thấy ata_map.parquet. Kiểm tra lại file định nghĩa ATA (phải có cột mã & tên).")
-
-    # (tùy chọn) Tự build rules non-defect từ ingest – BỎ qua theo yêu cầu gần đây
 
     # Tự build catalog nếu chưa có và đã có WO training
     try:
@@ -453,3 +458,115 @@ if uploaded is not None:
 
     if show_debug:
         st.write("Ví dụ citations:", citations_example[:3] if citations_example else None)
+
+# ----------------------------
+# BỔ SUNG: Kiểm tra & tải Catalog
+# ----------------------------
+
+def _flatten_catalog_to_df(catalog_path: str) -> pd.DataFrame:
+    """
+    Đọc catalog/ata_catalog.json và làm phẳng để soát xét nhanh:
+    - ATA04, Titles, Keywords, Sample_Phrases, Source, Notes
+    """
+    if not os.path.exists(catalog_path):
+        raise FileNotFoundError(f"Không tìm thấy {catalog_path}")
+
+    with open(catalog_path, "r", encoding="utf-8") as f:
+        cat = json.load(f)
+
+    rows = []
+    entries = (cat.get("entries") or {}) if isinstance(cat, dict) else {}
+    for ata04, item in entries.items():
+        titles = item.get("titles")
+        keywords = item.get("keywords")
+        samples = item.get("samples")
+        rows.append({
+            "ATA04": ata04,
+            "Titles": "; ".join(titles)   if isinstance(titles, list)   else (titles or ""),
+            "Keywords": "; ".join(keywords) if isinstance(keywords, list) else (keywords or ""),
+            "Sample_Phrases": "; ".join(samples) if isinstance(samples, list) else (samples or ""),
+            "Source": item.get("source") or "",
+            "Notes": item.get("notes") or "",
+        })
+    df = pd.DataFrame(rows).sort_values(by=["ATA04"]).reset_index(drop=True)
+    return df
+
+def _make_catalog_zip(zip_name: str = None):
+    """
+    Đóng gói:
+    - catalog/ata_catalog.json
+    - catalog/model/* (TF-IDF artifacts)
+    - data_store/ata_map.parquet, data_store/wo_training.parquet (nếu có)
+    - catalog/catalog_flat.csv (bảng phẳng để review)
+    """
+    if not os.path.isdir("catalog"):
+        raise FileNotFoundError("Chưa có thư mục 'catalog/'. Hãy build catalog trước.")
+    json_path = os.path.join("catalog", "ata_catalog.json")
+    if not os.path.exists(json_path):
+        raise FileNotFoundError("Không thấy 'catalog/ata_catalog.json'.")
+
+    df_flat = _flatten_catalog_to_df(json_path)
+    csv_bytes = df_flat.to_csv(index=False).encode("utf-8")
+
+    buf = io.BytesIO()
+    if not zip_name:
+        zip_name = "catalog_bundle.zip"
+
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # JSON
+        zf.write(json_path, arcname="catalog/ata_catalog.json")
+        # Model
+        model_dir = os.path.join("catalog", "model")
+        if os.path.isdir(model_dir):
+            for path in glob.glob(os.path.join(model_dir, "**"), recursive=True):
+                if os.path.isfile(path):
+                    arc = os.path.relpath(path, ".")
+                    zf.write(path, arcname=arc)
+        # Data store (nếu có)
+        ata_map = os.path.join("data_store", "ata_map.parquet")
+        if os.path.exists(ata_map):
+            zf.write(ata_map, arcname="data_store/ata_map.parquet")
+        wo_train = os.path.join("data_store", "wo_training.parquet")
+        if os.path.exists(wo_train):
+            zf.write(wo_train, arcname="data_store/wo_training.parquet")
+        # CSV phẳng
+        zf.writestr("catalog/catalog_flat.csv", csv_bytes)
+
+    buf.seek(0)
+    return buf, zip_name
+
+st.markdown("---")
+st.subheader("Kiểm tra & tải Catalog")
+
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("Xem nhanh catalog (bảng phẳng)"):
+        try:
+            if not catalog_exists():
+                st.warning("Catalog chưa sẵn sàng. Hãy build catalog trước.")
+            else:
+                df_flat = _flatten_catalog_to_df(str(CAT_JSON))
+                st.success(f"Đã đọc catalog: {len(df_flat)} dòng.")
+                st.dataframe(df_flat, use_container_width=True, hide_index=True)
+                st.download_button(
+                    label="Tải catalog_flat.csv",
+                    data=df_flat.to_csv(index=False).encode("utf-8"),
+                    file_name="catalog_flat.csv",
+                    mime="text/csv",
+                )
+        except Exception as e:
+            st.error(f"Không đọc được catalog. Lỗi: {e}")
+
+with col2:
+    if st.button("Tạo & tải gói Catalog (.zip)"):
+        try:
+            buf, zip_name = _make_catalog_zip()
+            st.success("Đã tạo gói Catalog.")
+            st.download_button(
+                label="Tải catalog_bundle.zip",
+                data=buf.getvalue(),
+                file_name=zip_name,
+                mime="application/zip",
+            )
+        except Exception as e:
+            st.error(f"Không thể tạo gói Catalog: {e}")
