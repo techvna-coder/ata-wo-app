@@ -2,9 +2,9 @@ import os
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
-import numpy as np  # đảm bảo đã import ở đầu file
 
 from core.gdrive_sync import sync_drive_folder
 from core.store import init_db, append_wo_training, append_ata_map
@@ -14,13 +14,28 @@ from core.nondefect import is_technical_defect
 from core.refs import extract_citations
 from core.ata_catalog import ATACatalog
 from core.decision import decide
-from core.mapping import ORDER_OUTCOLS
-from core.audit import audit_store, list_ingested_files, classify_all_ingested
+
+# (tùy chọn) Fallback LLM khi mơ hồ
+try:
+    from core.openai_helpers import llm_suggest_ata
+    HAS_LLM = True
+except Exception:
+    HAS_LLM = False
+
+# (tùy chọn) Audit
+try:
+    from core.audit import audit_store, list_ingested_files, classify_all_ingested
+    HAS_AUDIT = True
+except Exception:
+    HAS_AUDIT = False
+
 # ----------------------------
 # Cấu hình trang
 # ----------------------------
-st.set_page_config(page_title="WO → ATA04 Checker (Drive + Memory)", layout="wide")
+st.set_page_config(page_title="WO → ATA04 Checker (Drive + Memory + Optional LLM)", layout="wide")
 st.title("WO → ATA04 Checker (Drive + Incremental Memory)")
+
+# Khởi tạo kho dữ liệu
 init_db()
 
 # ----------------------------
@@ -41,10 +56,6 @@ def ensure_dirs():
 # Đọc Secrets (nếu có)
 # ----------------------------
 def _read_sa_json_from_secrets() -> bytes | None:
-    """
-    Tìm Service Account JSON trong st.secrets.
-    Hỗ trợ cả dạng string (JSON text) lẫn dict (object).
-    """
     candidates = [
         "GDRIVE_SERVICE_ACCOUNT_JSON",
         "SERVICE_ACCOUNT_JSON",
@@ -75,7 +86,7 @@ default_folder_id = _default_folder_from_secrets()
 default_sa_json_bytes = _read_sa_json_from_secrets()
 
 # ----------------------------
-# Sidebar: Kết nối Google Drive
+# Sidebar: Kết nối Google Drive và tuỳ chọn
 # ----------------------------
 with st.sidebar:
     st.header("Kết nối Google Drive")
@@ -98,11 +109,20 @@ with st.sidebar:
 
     st.markdown("---")
     do_rebuild = st.button("Rebuild Catalog từ bộ nhớ")
-    use_catalog = st.checkbox("Dùng Catalog (TF-IDF)", value=True)
-    show_debug = st.checkbox("Hiển thị debug", value=False)
-    
+
+    use_catalog = st.checkbox("Dùng Catalog (TF-IDF) offline", value=True)
+
+    # Tùy chọn LLM
     st.markdown("---")
-    do_audit = st.button("Kiểm tra dữ liệu đã đồng bộ (Audit)")
+    use_llm_fallback = st.checkbox("Dùng OpenAI khi mơ hồ/không xác định", value=True and HAS_LLM, disabled=(not HAS_LLM))
+    use_llm_enrich_build = st.checkbox("Dùng OpenAI làm giàu Catalog khi build", value=False, disabled=(not HAS_LLM))
+    low_conf_thresh = st.slider("Ngưỡng confidence kích hoạt LLM", 0.0, 1.0, 0.82, 0.01)
+
+    st.markdown("---")
+    show_debug = st.checkbox("Hiển thị debug", value=False)
+
+    st.markdown("---")
+    do_audit = st.button("Kiểm tra dữ liệu đã đồng bộ (Audit)", disabled=(not HAS_AUDIT))
 
 # ----------------------------
 # Đồng bộ & ingest dữ liệu
@@ -113,12 +133,10 @@ if do_sync:
         st.stop()
 
     ensure_dirs()
-    # Lưu SA JSON tạm
     sa_path = "data_store/sa.json"
     with open(sa_path, "wb") as f:
         f.write(sa_json_bytes)
 
-    # Gọi đồng bộ (bọc lỗi để hiển thị rõ ràng)
     try:
         changed = sync_drive_folder(folder_id, sa_path)
     except Exception as e:
@@ -175,7 +193,6 @@ if do_sync:
             ata_entered_col = find_col(ata_entered_patterns)
 
             # Thư giãn điều kiện: coi là WO nếu có mô tả + (ATA_final hoặc ATA_entered).
-            # Cột action nếu có thì tốt; nếu không có vẫn ingest được.
             if desc_col and (ata_final_col or ata_entered_col):
                 is_wo = True
 
@@ -186,11 +203,9 @@ if do_sync:
                     append_ata_map(df, code_col, name_col)
                     n_map += 1
             elif is_wo:
-                # Nếu không có action, truyền "" để append_wo_training xử lý
                 append_wo_training(df, desc_col, act_col or "", ata_final_col or "", ata_entered_col or "", p.name)
                 n_wo += 1
             else:
-                # Không phân loại được → show cột để người dùng biết
                 st.info(f"Không nhận diện được loại file: {p.name}. Một số cột đầu: {df.columns.tolist()[:12]}")
         except Exception as e:
             st.warning(f"Lỗi đọc {p.name}: {e}")
@@ -208,13 +223,14 @@ if do_sync:
     else:
         st.warning("Chưa thấy ata_map.parquet. Kiểm tra lại file định nghĩa ATA (phải có cột mã & tên).")
 
-    # Tự build catalog nếu chưa có
+    # (tùy chọn) Tự build rules non-defect từ ingest – BỎ qua theo yêu cầu gần đây
+
+    # Tự build catalog nếu chưa có và đã có WO training
     try:
         ensure_dirs()
         if not catalog_exists():
-            # Chỉ build khi đã có wo_training.parquet
             if Path("data_store/wo_training.parquet").exists():
-                stat = build_catalog_from_memory()
+                stat = build_catalog_from_memory(use_llm_enrich=bool(use_llm_enrich_build))
                 st.success(f"Catalog chưa có → đã build mới từ bộ nhớ ({len(stat)} lớp).")
             else:
                 st.warning("Không thể build catalog do chưa có data_store/wo_training.parquet.")
@@ -229,7 +245,7 @@ if do_sync:
 if do_rebuild:
     try:
         ensure_dirs()
-        stat = build_catalog_from_memory()
+        stat = build_catalog_from_memory(use_llm_enrich=bool(use_llm_enrich_build))
         st.success(f"Đã build Catalog từ bộ nhớ ({len(stat)} lớp).")
         st.dataframe(stat.head(30), use_container_width=True)
     except Exception as e:
@@ -238,19 +254,18 @@ if do_rebuild:
 # ----------------------------
 # KIỂM TRA DỮ LIỆU ĐÃ ĐỒNG BỘ (AUDIT)
 # ----------------------------
-if do_audit:
+if do_audit and HAS_AUDIT:
     st.header("Kiểm tra dữ liệu đã đồng bộ (Audit)")
 
-    # 1) Liệt kê file đã sync
     files = list_ingested_files()
     st.subheader("Danh sách file đã đồng bộ (manifest)")
     if files:
         df_files = pd.DataFrame(files)
-        st.dataframe(df_files[["name","path","modified"]], use_container_width=True)
+        show_cols = [c for c in ["name", "path", "modified"] if c in df_files.columns]
+        st.dataframe(df_files[show_cols], use_container_width=True)
     else:
         st.info("Chưa có manifest hoặc chưa sync file nào.")
 
-    # 2) Phân loại nhanh các file trong ingest
     st.subheader("Phân loại file trong data_store/ingest/")
     classified = classify_all_ingested(limit_preview_rows=5)
     for item in classified:
@@ -267,11 +282,9 @@ if do_audit:
         else:
             st.info("- Không nhận diện được loại file. Hãy xem lại tên cột.")
 
-    # 3) Tổng hợp store (parquet)
     st.subheader("Tổng hợp bộ nhớ (Parquet)")
     rep = audit_store()
 
-    # WO training
     wo_rep = rep.get("wo_training", {})
     if wo_rep.get("exists"):
         st.success(f"wo_training.parquet: {wo_rep['rows']} dòng, {wo_rep['distinct_ata04']} ATA04 khác nhau.")
@@ -282,7 +295,6 @@ if do_audit:
     else:
         st.warning("Chưa có data_store/wo_training.parquet.")
 
-    # ATA map
     ata_rep = rep.get("ata_map", {})
     if ata_rep.get("exists"):
         st.success(f"ata_map.parquet: {ata_rep['rows']} dòng.")
@@ -293,7 +305,6 @@ if do_audit:
     else:
         st.warning("Chưa có data_store/ata_map.parquet.")
 
-
 # ----------------------------
 # Xử lý WO mới (upload thủ công)
 # ----------------------------
@@ -301,17 +312,17 @@ st.header("Xử lý WO mới")
 uploaded = st.file_uploader("Upload Excel WO cần suy luận ATA corrected", type=["xlsx", "xls"])
 
 if uploaded is not None:
+    # df: khung nội bộ (đã map các cột chuẩn), dùng để suy luận
     df = load_wo_excel(uploaded)
     st.success(f"Đã nạp {len(df)} dòng.")
 
     catalog = None
     if use_catalog:
         try:
-            # Nếu chưa có catalog, cố build từ bộ nhớ trước khi nạp
             if not catalog_exists():
                 ensure_dirs()
                 if Path("data_store/wo_training.parquet").exists():
-                    stat = build_catalog_from_memory()
+                    stat = build_catalog_from_memory(use_llm_enrich=bool(use_llm_enrich_build))
                     st.info(f"Catalog chưa có → vừa build từ bộ nhớ ({len(stat)} lớp).")
                 else:
                     st.error("Chưa có data_store/wo_training.parquet để build catalog. Hãy đồng bộ Drive chứa WO lịch sử.")
@@ -332,7 +343,7 @@ if uploaded is not None:
         # 1) Non-Defect filter
         is_tech = is_technical_defect(defect, action)
 
-        # 2) E1: citations
+        # 2) E1: citations (trích AMM/TSM/FIM → chuẩn hoá → ATA04)
         citations = extract_citations(f"{defect or ''} {action or ''}")
         if citations and citations_example is None:
             citations_example = citations[:]
@@ -357,7 +368,7 @@ if uploaded is not None:
                 evidence_snip= e2_best.get("snippet")
                 evidence_src = e2_best.get("source")
 
-        # 4) Decision
+        # 4) Decision (tam-đối-soát)
         decision, conf, reason = decide(
             e0=(e0 if isinstance(e0, str) and len(e0) >= 5 else None),
             e1_valid=(is_tech and e1_valid),
@@ -366,6 +377,29 @@ if uploaded is not None:
             e2_all=None
         )
         ata_final = (e1_ata or derived_task or e0) if decision in ("CONFIRM", "CORRECT") else (derived_task or e1_ata or e0)
+
+        # 5) Fallback bằng LLM nếu mơ hồ/không xác định (tùy chọn)
+        llm_used = False
+        llm_reason = None
+        if use_llm_fallback and HAS_LLM and is_tech:
+            ambiguous = (decision == "REVIEW") or (conf is not None and conf < float(low_conf_thresh)) or (not (e1_ata or derived_task))
+            if ambiguous:
+                top_candidates = []
+                if isinstance(e2_best, dict) and e2_best.get("ata04"):
+                    top_candidates = [e2_best.get("ata04")]
+                cited_refs = []
+                if cited_manual and cited_task:
+                    cited_refs.append(f"{cited_manual} {cited_task}")
+
+                sugg = llm_suggest_ata(defect or "", action or "", top_candidates=top_candidates, cited_refs=cited_refs)
+                if sugg and isinstance(sugg.get("ata04"), str):
+                    ata_llm = sugg["ata04"]
+                    llm_reason = sugg.get("reason", "")
+                    ata_final = ata_llm
+                    decision = "CORRECT" if ata_final and ata_final != (e0 or "") else "CONFIRM"
+                    conf = max(conf or 0.0, 0.86)
+                    reason = (reason + " | LLM assist: " + llm_reason)[:900]
+                    llm_used = True
 
         results.append({
             "Is_Technical_Defect": bool(is_tech),
@@ -384,33 +418,36 @@ if uploaded is not None:
             "ATA04_Final": ata_final,
             "Confidence": conf,
             "Reason": reason,
+            "LLM_Used": llm_used,
         })
 
     res_df = pd.DataFrame(results)
 
-    # Ghi kết quả vào đúng các cột mong muốn, bổ sung vào file gốc
-    # 1) Cột đích chuẩn của app (giữ nguyên để tương thích)
-    # 2) Bổ sung thêm đúng các cột bạn yêu cầu
-    df["Is_Technical_Defect"] = res_df["Is_Technical_Defect"]
-    df["ATA04_final"] = res_df["ATA04_Final"]           # tên cột theo yêu cầu (f thường)
-    df["Confidence"] = res_df["Confidence"]
-    df["Decision"] = res_df["Decision"]
-    df["Reason"] = res_df["Reason"]
+    # === Xuất Excel: giữ NGUYÊN cột gốc, chỉ thêm các cột yêu cầu ===
+    raw_df = pd.read_excel(uploaded, dtype=str)  # giữ đúng tiêu đề/thứ tự cột gốc
+    out_df = raw_df.copy()
 
-    # 3) Đồng thời điền vào cột gốc “ATA 04 Corrected” nếu file gốc có cột này (để tiện so sánh/audit)
-    if "ATA 04 Corrected" in df.columns:
-        df["ATA 04 Corrected"] = res_df["ATA04_Final"]
+    # Bổ sung cột theo yêu cầu (không đụng vào "ATA 04 Corrected")
+    out_df["Is_Technical_Defect"] = res_df["Is_Technical_Defect"].astype(object)
+    out_df["ATA04_Final"]         = res_df["ATA04_Final"].astype(object)
+    out_df["Confidence"]           = res_df["Confidence"].astype(object)
+    out_df["Decision"]             = res_df["Decision"].astype(object)
+    out_df["Reason"]               = res_df["Reason"].astype(object)
 
-    # Hiển thị tóm tắt kết quả trên màn hình
-    view_cols = ["Is_Technical_Defect","Defect_Text","Rectification_Text", "ATA04_Entered","ATA04_Final", "ATA04_final", "Confidence", "Decision", "Reason"]
-    view_cols = [c for c in view_cols if c in df.columns]
+    # Nếu có cột WO_Number nhưng trống toàn bộ → loại bỏ
+    if "WO_Number" in out_df.columns:
+        if out_df["WO_Number"].replace(r"^\s*$", np.nan, regex=True).isna().all():
+            out_df = out_df.drop(columns=["WO_Number"])
+
+    # Hiển thị tóm tắt kết quả
+    view_cols = ["Is_Technical_Defect", "ATA04_Final", "Confidence", "Decision", "Reason"]
     st.subheader("Kết quả")
-    st.dataframe(df[view_cols].head(200), use_container_width=True)
+    st.dataframe(out_df[[c for c in view_cols if c in out_df.columns]].head(200), use_container_width=True)
 
-    # Xuất file giữ nguyên dữ liệu gốc + cột bổ sung
-    from pathlib import Path
-    out_name = f"{Path(uploaded.name).stem}_ATA_checked.xlsx"
-    path = write_result(df, path=out_name)
+    # Xuất file kết quả
+    from pathlib import Path as _Path
+    out_name = f"{_Path(uploaded.name).stem}_ATA_checked.xlsx"
+    path = write_result(out_df, path=out_name)
     st.download_button("Tải kết quả Excel", data=open(path, "rb"), file_name=out_name)
 
     if show_debug:
