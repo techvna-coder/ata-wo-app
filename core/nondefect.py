@@ -65,15 +65,16 @@ PAT_DEFECT_WITH_CONTEXT = [
     r"\b(phát\s*hiện|ghi\s*nhận|quan\s*sát|báo\s*cáo)\b.*?\b(hư\s*hỏng|hỏng\s*hóc|hư\s*hại|nứt)\b",
 ]
 
-# Hành động khắc phục mạnh (siết chặt SB/AD phải có động từ embody/apply/comply/implement…)
+# Hành động khắc phục mạnh (bắt đủ replace/replaced/replacing/replacement; SB/AD phải có động từ embody/apply/comply/implement…)
 PAT_CORRECTIVE_STRONG = [
-    r"\breplace(d|ment)?\b", r"\brepair(ed|ing)?\b", r"\brectif(y|ied|ication)\b",
+    r"\breplac(e|ed|ing|ement)\b",
+    r"\brepair(ed|ing)?\b", r"\brectif(y|ied|ication)\b",
     r"\btroubleshoot(ing)?\b", r"\badjust(ed|ment)?\b", r"\bmodif(y|ication|ied)\b",
     r"\bcalibrat(e|ion|ed)\b", r"\bMEL\b", r"\bdeferr(al|ed)\b",
     r"\b(embod(y|ied)|incorporat(e|ed)|accomplish(ed)?|comply\s+with|implemented?|appl(ied|y))\b\s+(SB|Service\s+Bulletin)\b",
     r"\b(embod(y|ied)|incorporat(e|ed)|accomplish(ed)?|comply\s+with|implemented?|appl(ied|y))\b\s+(AD|Airworthiness\s+Directive)\b",
-    # Biến thể thường thấy
-    r"\bC/O\s+REPLAC(ED|E|EMENT)\b",
+    # Biến thể thường thấy trong log
+    r"\bC/O\s+REPLAC(ED|E|ING|EMENT)\b",
     # Việt
     r"\bsửa\s*chữa\b", r"\bthay\b", r"\bthay\s*mới\b", r"\bđiều\s*chỉnh\b", r"\bchỉnh\s*căn\b",
 ]
@@ -152,7 +153,7 @@ PAT_META_LINES = [
     r"^\s*JOB\s+SET[- ]?UP\b.*",
     r"^\s*PREPARATION:.*",
     r"^\s*CLOSE[- ]?UP:.*",
-    r"\b(WORKSTEP\s+ADDED\s+BY|ACTION\s+PERFORMED\s+BY|PERFORMED\s+SIGN|DESCRIPTION\s*SIGN)\b.*",
+    r"\b(WORKSTEP\s+ADDED\s+BY|ACTION\s+PERFORMED\s+BY|PERFORMED\s*SIGN|DESCRIPTION\s*SIGN)\b.*",
     r"\bFINDING\s*\(NRC\)\b.*", r"\bPART\s+REQUIREMENT\b.*",
     r"\bS\.?O[-–][A-Z0-9\-\.]+\b.*",
     r"^\s*NOTE:\b.*", r"^\s*FILE\s+LOCATED\b.*",
@@ -270,7 +271,12 @@ def classify_nondefect_reason(
     if re.search(r"\bFINDING\s*\(NRC\)", text, flags=re.I):
         if re.search(r"\bfound\b", text, flags=re.I) or \
            re.search(r"\bdamage(d)?\b|\bdefect(s)?\b", text, flags=re.I) or \
-           re.search(r"\breplac(e|ed|ement)\b|\brepair(ed|ing)?\b", text, flags=re.I):
+           re.search(r"\breplac(e|ed|ing|ement)\b|\brepair(ed|ing)?\b", text, flags=re.I):
+            hits["defect_with_context"] += 1
+
+    # Booster “damage/defect + corrective (mạnh/yếu)” ⇒ tăng ngữ cảnh defect
+    if re.search(r"\b(damage(d)?|defect(s)?)\b", text, flags=re.I):
+        if hits["corrective_strong"] > 0 or hits["corrective_weak"] > 0:
             hits["defect_with_context"] += 1
 
     is_scheduled_type = bool(RX_SCHEDULED_TYPE.search(_normalize(wo_type or "")))
