@@ -13,14 +13,14 @@ WEIGHTS = {
     # Tín hiệu nghiêng Defect
     "strong_symptom":      4.0,   # fault/failure/leak/overheat/vibration/smoke/INOP/short/trip + ECAM/EICAS/CAS/ACARS/FWS
     "warn_ctx":            3.0,   # ECAM/EICAS/CAS warning/caution, hoặc warning|caution + light/message/indication
-    "defect_with_context": 3.0,   # "defect|damage" + found/detected/observed/noted/present/occurred
-    "corrective_strong":   3.5,   # replace/repair/rectify/troubleshoot/adjust/modify/calibrate + embody/apply/comply SB/AD/MEL/defer
-    "corrective_weak":     1.0,   # remove/install (không context overhaul/inspection)
+    "defect_with_context": 3.2,   # "defect|damage" <-> "found|detected|observed|noted|present|occurred" (hai chiều)
+    "corrective_strong":   3.8,   # replace/repair/rectify/troubleshoot/adjust/modify/calibrate + embody/apply/comply SB/AD/MEL/defer
+    "corrective_weak":     0.8,   # remove/install (có thể routine)
 
     # Tín hiệu nghiêng Non-Defect
-    "scheduled_routine":   3.5,   # Type=SCHEDULED + routine/inspection/ops/functional/leak check OK, AMM 05/200-xxx
-    "routine_generic":     2.0,   # routine/periodic/visual/zonal/borescope/perform check/ops test
-    "no_finding":          2.5,   # no abnormality/defect/fault/finding/discrepancy; serviceable/normal
+    "scheduled_routine":   3.7,   # Type=SCHEDULED + routine/inspection/ops/functional/leak check OK, AMM 05/200-xxx
+    "routine_generic":     1.8,   # routine/periodic/visual/zonal/borescope/perform check/ops test
+    "no_finding":          2.6,   # no abnormality/defect/fault/finding/discrepancy; serviceable/normal
     "cosmetic":            3.0,   # paint peel/chip/scratch; nameplate/placard/decal/label missing/faded/worn
     "natural_wear":        2.5,   # tyre/tire wear, brake wear, erosion/weathering
     "scheduled_overhaul":  2.5,   # send/remove for bench test/overhaul/shop visit (theo lịch)
@@ -34,7 +34,7 @@ THRESHOLDS = {
 # 1) MẪU NHẬN DIỆN (Anh + Việt)
 # ============================================================
 
-# Triệu chứng/cảnh báo mạnh (không tính warning/caution chung chung)
+# Triệu chứng/cảnh báo mạnh (đÃ LOẠI 'warning'/'caution' chung chung)
 PAT_STRONG_SYMPTOM = [
     r"\bfail(ure|ed)?\b", r"\bfault(s)?\b", r"\bmalfunction\b",
     r"\bleak(s|ing)?\b", r"\boverheat(ing)?\b", r"\bvibrat(e|ion|ing)\b",
@@ -42,11 +42,11 @@ PAT_STRONG_SYMPTOM = [
     r"\bno\s*go\b", r"\binop(erative)?\b", r"\bdegrad(ed|ation)\b",
     r"\bshort( circuit)?\b", r"\btrip(ped)?\b",
     r"\bECAM\b", r"\bEICAS\b", r"\bCAS\b", r"\bACARS\b", r"\bFWS\b",
-    # Tiếng Việt – triệu chứng
-    r"\brò\b", r"\brò\s*ri\b", r"\brỉ\b", r"\brò\s*dị\b",   # rò/ri dị (biến thể)
+    # Việt – triệu chứng
+    r"\brò\b", r"\brò\s*ri\b", r"\brỉ\b", r"\brò\s*dị\b",
     r"\brò\s*rỉ\b", r"\brò\s*khí\b", r"\brò\s*nhiên\s*liệu\b",
-    r"\bquá\s*nhiệt\b", r"\brung\b", r"\brung\s*lắc\b", r"\bhỏng\b",
-    r"\blỗi\b", r"\bcảnh\s*báo\b", r"\bbáo\s*động\b",
+    r"\bquá\s*nhiệt\b", r"\brung\b", r"\brung\s*lắc\b",
+    r"\bhỏng\b", r"\blỗi\b", r"\bbáo\s*động\b", r"\bcảnh\s*báo\b",
 ]
 
 # Cảnh báo có ngữ cảnh hệ thống
@@ -56,25 +56,29 @@ PAT_WARN_CTX = [
     r"\bcaution\s*(light|message|caption|indication)\b",
 ]
 
-# "defect/damage" chỉ khi có ngữ cảnh found/detected/observed/noted/present/occurred
+# "defect/damage" có NGỮ CẢNH (HAI CHIỀU: A→B hoặc B→A), tránh NOTE/DIRECTORY
 PAT_DEFECT_WITH_CONTEXT = [
-    r"\b(defect(s)?|damage(d)?)\b(?=.*\b(found|detected|observed|reported|noted|occurred|present)\b)",
+    r"\b(defect(s)?|damage(d)?)\b(?!.{0,400}?\b(NOTE|directory|file located)\b).*?\b(found|detected|observed|reported|noted|occurred|present)\b",
+    r"\b(found|detected|observed|reported|noted|occurred|present)\b(?!.{0,400}?\b(NOTE|directory|file located)\b).*?\b(defect(s)?|damage(d)?)\b",
     # Việt
-    r"\b(hư\s*hỏng|hỏng\s*hóc|hư\s*hại|nứt)\b(?=.*\b(phát\s*hiện|ghi\s*nhận|quan\s*sát|báo\s*cáo)\b)",
+    r"\b(hư\s*hỏng|hỏng\s*hóc|hư\s*hại|nứt)\b.*?\b(phát\s*hiện|ghi\s*nhận|quan\s*sát|báo\s*cáo)\b",
+    r"\b(phát\s*hiện|ghi\s*nhận|quan\s*sát|báo\s*cáo)\b.*?\b(hư\s*hỏng|hỏng\s*hóc|hư\s*hại|nứt)\b",
 ]
 
-# Hành động khắc phục (siết chặt SB/AD phải có động từ embody/apply/comply/implement…)
+# Hành động khắc phục mạnh (siết chặt SB/AD phải có động từ embody/apply/comply/implement…)
 PAT_CORRECTIVE_STRONG = [
     r"\breplace(d|ment)?\b", r"\brepair(ed|ing)?\b", r"\brectif(y|ied|ication)\b",
     r"\btroubleshoot(ing)?\b", r"\badjust(ed|ment)?\b", r"\bmodif(y|ication|ied)\b",
     r"\bcalibrat(e|ion|ed)\b", r"\bMEL\b", r"\bdeferr(al|ed)\b",
     r"\b(embod(y|ied)|incorporat(e|ed)|accomplish(ed)?|comply\s+with|implemented?|appl(ied|y))\b\s+(SB|Service\s+Bulletin)\b",
     r"\b(embod(y|ied)|incorporat(e|ed)|accomplish(ed)?|comply\s+with|implemented?|appl(ied|y))\b\s+(AD|Airworthiness\s+Directive)\b",
+    # Biến thể thường thấy
+    r"\bC/O\s+REPLAC(ED|E|EMENT)\b",
     # Việt
     r"\bsửa\s*chữa\b", r"\bthay\b", r"\bthay\s*mới\b", r"\bđiều\s*chỉnh\b", r"\bchỉnh\s*căn\b",
 ]
 
-# Hành động yếu (remove/install) – có thể routine
+# Hành động yếu (có thể routine)
 PAT_CORRECTIVE_WEAK = [
     r"\bremove(d|al)?\b", r"\binstall(ed|ation)?\b",
     # Việt
@@ -148,7 +152,7 @@ PAT_META_LINES = [
     r"^\s*JOB\s+SET[- ]?UP\b.*",
     r"^\s*PREPARATION:.*",
     r"^\s*CLOSE[- ]?UP:.*",
-    r"\b(WORKSTEP\s+ADDED\s+BY|ACTION\s+PERFORMED\s+BY|PERFORMED\s+SIGN|DESCRIPTION\s+SIGN)\b.*",
+    r"\b(WORKSTEP\s+ADDED\s+BY|ACTION\s+PERFORMED\s+BY|PERFORMED\s+SIGN|DESCRIPTION\s*SIGN)\b.*",
     r"\bFINDING\s*\(NRC\)\b.*", r"\bPART\s+REQUIREMENT\b.*",
     r"\bS\.?O[-–][A-Z0-9\-\.]+\b.*",
     r"^\s*NOTE:\b.*", r"^\s*FILE\s+LOCATED\b.*",
@@ -164,7 +168,6 @@ PAT_META_LINES = [
     r"^\s*CHUẨN\s*BỊ:.*",
     r"^\s*KẾT\s*THÚC:.*",
 ]
-
 # Parenthetical meta to drop
 PAREN_META = r"\((?=[^)]*(note|file\s+located|directory://|refer\s+note|see\s+note|chú\s*thích))[^)]*\)"
 
@@ -202,7 +205,6 @@ WS = re.compile(r"[ \t]+")
 def _normalize(text: str) -> str:
     if text is None:
         return ""
-    # chuẩn hoá unicode + lower + gộp khoảng
     t = unicodedata.normalize("NFKC", str(text)).strip()
     t = re.sub(r"\s+", " ", t)
     return t
@@ -210,15 +212,14 @@ def _normalize(text: str) -> str:
 def _strip_meta(text: str) -> str:
     if not text:
         return ""
-    # bỏ các cụm trong ngoặc chứa NOTE/FILE/DIRECTORY/CHÚ THÍCH
     cleaned = RX_PAREN_META.sub(" ", str(text))
-    # bỏ dòng meta; chỉ giữ nếu dòng meta có symptom hệ thống
     kept = []
     for ln in re.split(r"[\r\n]+", cleaned):
         ln = ln.strip()
         if not ln:
             continue
         if RX_META_LINES.search(ln):
+            # Nếu dòng meta nhưng có cảnh báo hệ thống / symptom mạnh → giữ
             if RX_WARN_CTX.search(ln) or RX_STRONG_SYMPTOM.search(ln):
                 kept.append(ln)
             continue
@@ -251,18 +252,26 @@ def classify_nondefect_reason(
 
     # Đếm tín hiệu
     hits = {
-        "strong_symptom":      _count(RX_STRONG_SYMPTOM, text) + _count(RX_WARN_CTX, text),
+        "strong_symptom":      _count(RX_STRONG_SYMPTOM, text),
+        "warn_ctx":            _count(RX_WARN_CTX, text),
         "defect_with_context": _count(RX_DEFECT_WITH_CONTEXT, text),
         "corrective_strong":   _count(RX_CORR_STRONG, text),
         "corrective_weak":     _count(RX_CORR_WEAK, text),
 
-        "scheduled_routine":   0,  # tính theo Type + routine
+        "scheduled_routine":   0,  # tính theo Type + routine/overhaul
         "routine_generic":     _count(RX_ROUTINE_GENERIC, text),
         "no_finding":          _count(RX_NO_FINDING, text),
         "cosmetic":            _count(RX_COSMETIC, text),
         "natural_wear":        _count(RX_WEAR, text),
         "scheduled_overhaul":  _count(RX_SCHED_OVH, text),
     }
+
+    # Booster NRC: nếu có 'FINDING (NRC)' + (found|damage/defect|replace/repair) → cộng nhẹ vào defect_with_context
+    if re.search(r"\bFINDING\s*\(NRC\)", text, flags=re.I):
+        if re.search(r"\bfound\b", text, flags=re.I) or \
+           re.search(r"\bdamage(d)?\b|\bdefect(s)?\b", text, flags=re.I) or \
+           re.search(r"\breplac(e|ed|ement)\b|\brepair(ed|ing)?\b", text, flags=re.I):
+            hits["defect_with_context"] += 1
 
     is_scheduled_type = bool(RX_SCHEDULED_TYPE.search(_normalize(wo_type or "")))
     if is_scheduled_type and (hits["routine_generic"] > 0 or hits["scheduled_overhaul"] > 0):
@@ -271,6 +280,7 @@ def classify_nondefect_reason(
     # Tính điểm
     defect_score = (
         hits["strong_symptom"]      * WEIGHTS["strong_symptom"] +
+        hits["warn_ctx"]            * WEIGHTS["warn_ctx"] +
         hits["defect_with_context"] * WEIGHTS["defect_with_context"] +
         hits["corrective_strong"]   * WEIGHTS["corrective_strong"] +
         hits["corrective_weak"]     * WEIGHTS["corrective_weak"]
@@ -284,21 +294,20 @@ def classify_nondefect_reason(
         hits["scheduled_overhaul"]  * WEIGHTS["scheduled_overhaul"]
     )
 
-    # Luật ưu tiên tuyệt đối:
-    # - Nếu có strong symptom / defect_with_context / corrective_strong đáng kể → Defect
+    # Luật ưu tiên tuyệt đối (đặt trước scheduled-routine)
     if hits["strong_symptom"] > 0 or hits["defect_with_context"] > 0 or hits["corrective_strong"] > 0:
-        # Nhưng nếu là scheduled & có no_finding & routine mạnh → cân nhắc giảm
+        # Trường hợp đặc biệt: nếu scheduled + có no_finding + routine mạnh → cho phép rơi về so điểm thường
         if is_scheduled_type and hits["no_finding"] > 0 and hits["routine_generic"] > 0 and defect_score < (nondef_score + 1.5):
-            pass  # rơi về so điểm bình thường
+            pass
         else:
             return True, "Có triệu chứng/hành động khắc phục/‘defect|damage’ có ngữ cảnh.", {
                 "defect_score": defect_score, "nondef_score": nondef_score, "hits": hits, "priority_rule": "defect_signals"
             }
 
-    # - Nếu Type=SCHEDULED, có routine/overhaul và không có dấu hiệu defect rõ → Non-Defect
+    # Ưu tiên: Scheduled + Routine + không symptom/defect_ctx/corrective_strong → NON-DEFECT
     if is_scheduled_type and (hits["routine_generic"] > 0 or hits["scheduled_overhaul"] > 0):
         if (hits["strong_symptom"] == 0 and hits["defect_with_context"] == 0 and hits["corrective_strong"] == 0):
-            return False, "WO định kỳ (Type=SCHEDULED) với nội dung inspection/ops test/overhaul và không có symptom.", {
+            return False, "WO định kỳ (Type=SCHEDULED) với nội dung inspection/ops test/overhaul; không có symptom.", {
                 "defect_score": defect_score, "nondef_score": nondef_score, "hits": hits, "priority_rule": "scheduled_routine"
             }
 
@@ -313,12 +322,13 @@ def classify_nondefect_reason(
             "defect_score": defect_score, "nondef_score": nondef_score, "hits": hits
         }
 
-    # Trường hợp sát nút: ưu tiên an toàn → Defect, nhưng nếu có no_finding + scheduled + routine thì Non-Defect
+    # Sát nút: nếu scheduled + no_finding + routine và không có symptom mạnh → Non-Defect
     if is_scheduled_type and hits["no_finding"] > 0 and hits["routine_generic"] > 0 and hits["strong_symptom"] == 0:
         return False, "Scheduled + no-finding + routine: phân loại Non-Defect.", {
             "defect_score": defect_score, "nondef_score": nondef_score, "hits": hits, "tie_break": "scheduled_no_finding"
         }
 
+    # Mặc định thận trọng
     return True, "Biên độ điểm nhỏ; mặc định coi là Defect để bảo toàn độ tin cậy.", {
         "defect_score": defect_score, "nondef_score": nondef_score, "hits": hits, "tie_break": "safety_first"
     }
