@@ -119,18 +119,7 @@ with st.sidebar:
 
     use_catalog = st.checkbox("Dùng Catalog (TF-IDF) offline", value=True)
 
-    st.markdown("---")
-    st.subheader("Nạp thủ công ATA Map (tùy chọn)")
-    ata_file = st.file_uploader("Upload Excel ATA Map (có cột mã ATA04 và tên hệ thống)", type=["xlsx", "xls"], key="ata_manual")
-    if ata_file is not None:
-        try:
-            df_ata = pd.read_excel(ata_file, dtype=str)
-            append_ata_map(df_ata,  # hàm đã có trong core.store
-                           code_col=next(c for c in df_ata.columns if re.search(r"ata.*0?4|^ata$|code", c, flags=re.I)),
-                           name_col=next(c for c in df_ata.columns if re.search(r"name|title|system|mô tả|mo ta|description", c, flags=re.I)))
-            st.success("Đã nạp ATA map vào bộ nhớ (ata_map.parquet).")
-        except Exception as e:
-            st.error(f"Lỗi nạp ATA map: {e}")
+    
     # Tùy chọn LLM
     st.markdown("---")
     use_llm_fallback = st.checkbox("Dùng OpenAI khi mơ hồ/không xác định", value=True and HAS_LLM, disabled=(not HAS_LLM))
