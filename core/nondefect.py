@@ -11,9 +11,9 @@ from typing import Tuple, Dict, Any, Optional
 
 WEIGHTS = {
     # Tín hiệu nghiêng Defect
-    "strong_symptom":      4.0,   # fault/failure/leak/overheat/vibration/smoke/INOP/short/trip + ECAM/EICAS/CAS/ACARS/FWS
+    "strong_symptom":      4.0,   # fault/failure/leak/overheat/vibration/smoke/INOP/short/trip/crack + ECAM/EICAS/CAS/ACARS/FWS
     "warn_ctx":            3.0,   # ECAM/EICAS/CAS warning/caution, hoặc warning|caution + light/message/indication
-    "defect_with_context": 3.2,   # "defect|damage" <-> "found|detected|observed|noted|present|occurred" (hai chiều)
+    "defect_with_context": 3.2,   # "defect|damage|crack" <-> "found|detected|observed|noted|present|occurred" (hai chiều)
     "corrective_strong":   3.8,   # replace/repair/rectify/troubleshoot/adjust/modify/calibrate + embody/apply/comply SB/AD/MEL/defer
     "corrective_weak":     0.8,   # remove/install (có thể routine)
 
@@ -41,6 +41,7 @@ PAT_STRONG_SYMPTOM = [
     r"\bsmoke\b", r"\bintermittent\b", r"\bspurious\b",
     r"\bno\s*go\b", r"\binop(erative)?\b", r"\bdegrad(ed|ation)\b",
     r"\bshort( circuit)?\b", r"\btrip(ped)?\b",
+    r"\bcrack(s|ed)?\b",
     r"\bECAM\b", r"\bEICAS\b", r"\bCAS\b", r"\bACARS\b", r"\bFWS\b",
     # Việt – triệu chứng
     r"\brò\b", r"\brò\s*ri\b", r"\brỉ\b", r"\brò\s*dị\b",
@@ -56,16 +57,16 @@ PAT_WARN_CTX = [
     r"\bcaution\s*(light|message|caption|indication)\b",
 ]
 
-# "defect/damage" có NGỮ CẢNH (HAI CHIỀU: A→B hoặc B→A), tránh NOTE/DIRECTORY
+# "defect/damage/crack" có NGỮ CẢNH (HAI CHIỀU)
 PAT_DEFECT_WITH_CONTEXT = [
-    r"\b(defect(s)?|damage(d)?)\b(?!.{0,400}?\b(NOTE|directory|file located)\b).*?\b(found|detected|observed|reported|noted|occurred|present)\b",
-    r"\b(found|detected|observed|reported|noted|occurred|present)\b(?!.{0,400}?\b(NOTE|directory|file located)\b).*?\b(defect(s)?|damage(d)?)\b",
+    r"\b(defect(s)?|damage(d)?|crack(s)?|cracked)\b(?!.{0,400}?\b(NOTE|directory|file located)\b).*?\b(found|detected|observed|reported|noted|occurred|present)\b",
+    r"\b(found|detected|observed|reported|noted|occurred|present)\b(?!.{0,400}?\b(NOTE|directory|file located)\b).*?\b(defect(s)?|damage(d)?|crack(s)?|cracked)\b",
     # Việt
     r"\b(hư\s*hỏng|hỏng\s*hóc|hư\s*hại|nứt)\b.*?\b(phát\s*hiện|ghi\s*nhận|quan\s*sát|báo\s*cáo)\b",
     r"\b(phát\s*hiện|ghi\s*nhận|quan\s*sát|báo\s*cáo)\b.*?\b(hư\s*hỏng|hỏng\s*hóc|hư\s*hại|nứt)\b",
 ]
 
-# Hành động khắc phục mạnh (bắt đủ replace/replaced/replacing/replacement; SB/AD phải có động từ embody/apply/comply/implement…)
+# Hành động khắc phục mạnh (bắt đủ replace/replaced/replacing/replacement; SB/AD cần động từ)
 PAT_CORRECTIVE_STRONG = [
     r"\breplac(e|ed|ing|ement)\b",
     r"\brepair(ed|ing)?\b", r"\brectif(y|ied|ication)\b",
@@ -153,7 +154,7 @@ PAT_META_LINES = [
     r"^\s*JOB\s+SET[- ]?UP\b.*",
     r"^\s*PREPARATION:.*",
     r"^\s*CLOSE[- ]?UP:.*",
-    r"\b(WORKSTEP\s+ADDED\s+BY|ACTION\s+PERFORMED\s+BY|PERFORMED\s*SIGN|DESCRIPTION\s*SIGN)\b.*",
+    r"\b(WORKSTEP\s+ADDED\s+BY|PERFORMED\s*SIGN|DESCRIPTION\s*SIGN)\b.*",
     r"\bFINDING\s*\(NRC\)\b.*", r"\bPART\s+REQUIREMENT\b.*",
     r"\bS\.?O[-–][A-Z0-9\-\.]+\b.*",
     r"^\s*NOTE:\b.*", r"^\s*FILE\s+LOCATED\b.*",
@@ -220,8 +221,9 @@ def _strip_meta(text: str) -> str:
         if not ln:
             continue
         if RX_META_LINES.search(ln):
-            # Nếu dòng meta nhưng có cảnh báo hệ thống / symptom mạnh → giữ
-            if RX_WARN_CTX.search(ln) or RX_STRONG_SYMPTOM.search(ln):
+            # GIỮ nếu dòng meta có cảnh báo hệ thống / triệu chứng mạnh / HÀNH ĐỘNG KHẮC PHỤC (mạnh hoặc yếu)
+            if (RX_WARN_CTX.search(ln) or RX_STRONG_SYMPTOM.search(ln) or
+                RX_CORR_STRONG.search(ln) or RX_CORR_WEAK.search(ln)):
                 kept.append(ln)
             continue
         kept.append(ln)
@@ -267,15 +269,15 @@ def classify_nondefect_reason(
         "scheduled_overhaul":  _count(RX_SCHED_OVH, text),
     }
 
-    # Booster NRC: nếu có 'FINDING (NRC)' + (found|damage/defect|replace/repair) → cộng nhẹ vào defect_with_context
+    # Booster NRC: nếu có 'FINDING (NRC)' + (found|damage/defect|crack|replace/repair) → cộng nhẹ vào defect_with_context
     if re.search(r"\bFINDING\s*\(NRC\)", text, flags=re.I):
-        if re.search(r"\bfound\b", text, flags=re.I) or \
-           re.search(r"\bdamage(d)?\b|\bdefect(s)?\b", text, flags=re.I) or \
-           re.search(r"\breplac(e|ed|ing|ement)\b|\brepair(ed|ing)?\b", text, flags=re.I):
+        if (re.search(r"\bfound\b", text, flags=re.I) or
+            re.search(r"\b(damage(d)?|defect(s)?|crack(s)?|cracked)\b", text, flags=re.I) or
+            re.search(r"\breplac(e|ed|ing|ement)\b|\brepair(ed|ing)?\b", text, flags=re.I)):
             hits["defect_with_context"] += 1
 
-    # Booster “damage/defect + corrective (mạnh/yếu)” ⇒ tăng ngữ cảnh defect
-    if re.search(r"\b(damage(d)?|defect(s)?)\b", text, flags=re.I):
+    # Booster “(damage|defect|crack) + corrective (mạnh/yếu)” ⇒ tăng ngữ cảnh defect
+    if re.search(r"\b(damage(d)?|defect(s)?|crack(s)?|cracked)\b", text, flags=re.I):
         if hits["corrective_strong"] > 0 or hits["corrective_weak"] > 0:
             hits["defect_with_context"] += 1
 
@@ -306,7 +308,7 @@ def classify_nondefect_reason(
         if is_scheduled_type and hits["no_finding"] > 0 and hits["routine_generic"] > 0 and defect_score < (nondef_score + 1.5):
             pass
         else:
-            return True, "Có triệu chứng/hành động khắc phục/‘defect|damage’ có ngữ cảnh.", {
+            return True, "Có triệu chứng/hành động khắc phục/‘defect|damage|crack’ có ngữ cảnh.", {
                 "defect_score": defect_score, "nondef_score": nondef_score, "hits": hits, "priority_rule": "defect_signals"
             }
 
