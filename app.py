@@ -466,8 +466,13 @@ if uploaded is not None:
 
 def _flatten_catalog_to_df(catalog_path: str) -> pd.DataFrame:
     """
-    Đọc catalog/ata_catalog.json và làm phẳng để soát xét nhanh:
-    - ATA04, Titles, Keywords, Sample_Phrases, Source, Notes
+    Đọc catalog/ata_catalog.json và làm phẳng để soát xét.
+    Tương thích nhiều schema:
+    - {"entries": { "21-52": {...}, "27-10": {...}, ...}}
+    - {"entries": [ {"ATA04":"21-52", ...}, {"ata04":"27-10", ...}, ... ]}
+    - [ {"ATA04":"21-52", ...}, ... ]
+    - {"catalog":[...]}  (ít gặp)
+    Mỗi item có thể có: titles, keywords, samples, source, notes.
     """
     if not os.path.exists(catalog_path):
         raise FileNotFoundError(f"Không tìm thấy {catalog_path}")
@@ -475,66 +480,148 @@ def _flatten_catalog_to_df(catalog_path: str) -> pd.DataFrame:
     with open(catalog_path, "r", encoding="utf-8") as f:
         cat = json.load(f)
 
+    # Helper an toàn
+    def _to_str_list(v):
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple, set)):
+            return [str(x) for x in v if x is not None]
+        return [str(v)]
+
+    def _pick_ata04(d, fallback_key=None):
+        # Lấy mã ATA04 từ nhiều key khả dĩ
+        for k in ("ATA04", "ata04", "ATA_04", "ata_04", "code", "Code", "ata", "ATA"):
+            if isinstance(d, dict) and k in d and d[k]:
+                return str(d[k]).strip().upper()
+        if fallback_key:
+            return str(fallback_key).strip().upper()
+        return None
+
+    # Chuẩn hoá về list các item
+    items = []
+    if isinstance(cat, dict) and "entries" in cat:
+        entries = cat["entries"]
+        if isinstance(entries, dict):
+            # Dạng map: {"21-52": {...}, ...}
+            for key, val in entries.items():
+                ata = _pick_ata04(val, fallback_key=key)
+                items.append((ata, val or {}))
+        elif isinstance(entries, list):
+            for val in entries:
+                ata = _pick_ata04(val)
+                items.append((ata, val or {}))
+        else:
+            raise ValueError("Trường 'entries' có kiểu không hỗ trợ.")
+    elif isinstance(cat, list):
+        for val in cat:
+            ata = _pick_ata04(val)
+            items.append((ata, val or {}))
+    elif isinstance(cat, dict) and "catalog" in cat and isinstance(cat["catalog"], list):
+        for val in cat["catalog"]:
+            ata = _pick_ata04(val)
+            items.append((ata, val or {}))
+    else:
+        # Thử coi cả object là 1 item
+        ata = _pick_ata04(cat)
+        items.append((ata, cat if isinstance(cat, dict) else {}))
+
     rows = []
-    entries = (cat.get("entries") or {}) if isinstance(cat, dict) else {}
-    for ata04, item in entries.items():
-        titles = item.get("titles")
-        keywords = item.get("keywords")
-        samples = item.get("samples")
+    for ata, it in items:
+        titles   = _to_str_list(it.get("titles") or it.get("Titles"))
+        keywords = _to_str_list(it.get("keywords") or it.get("Keywords"))
+        samples  = _to_str_list(it.get("samples") or it.get("Samples") or it.get("sample_phrases"))
+        source   = it.get("source") or it.get("Source") or ""
+        notes    = it.get("notes")  or it.get("Notes")  or ""
+
         rows.append({
-            "ATA04": ata04,
-            "Titles": "; ".join(titles)   if isinstance(titles, list)   else (titles or ""),
-            "Keywords": "; ".join(keywords) if isinstance(keywords, list) else (keywords or ""),
-            "Sample_Phrases": "; ".join(samples) if isinstance(samples, list) else (samples or ""),
-            "Source": item.get("source") or "",
-            "Notes": item.get("notes") or "",
+            "ATA04": ata,
+            "Titles": "; ".join(titles),
+            "Keywords": "; ".join(keywords),
+            "Sample_Phrases": "; ".join(samples),
+            "Source": source,
+            "Notes": notes,
         })
-    df = pd.DataFrame(rows).sort_values(by=["ATA04"]).reset_index(drop=True)
+
+    df = pd.DataFrame(rows)
+    # Dọn dẹp: chỉ giữ các dòng có ATA04 hợp lệ dạng AA-BB (nếu có)
+    if "ATA04" in df.columns:
+        df["ATA04"] = df["ATA04"].astype(str).str.upper().str.strip()
+        # Chuẩn hoá về AA-BB nếu có dạng "21-5200" or "2152"
+        df["ATA04"] = df["ATA04"].str.replace(r"[^0-9\-]", "", regex=True)
+        def _fix(ata):
+            if not isinstance(ata, str) or not ata:
+                return ata
+            if "-" in ata:
+                parts = ata.split("-")
+                if len(parts[0]) >= 2 and len(parts[1]) >= 2:
+                    return f"{parts[0][:2]}-{parts[1][:2]}"
+            # Nếu là 4 số liền: 2152 → 21-52
+            if ata.isdigit() and len(ata) >= 4:
+                return f"{ata[:2]}-{ata[2:4]}"
+            return ata
+        df["ATA04"] = df["ATA04"].map(_fix)
+        # loại dòng thiếu mã
+        df = df[df["ATA04"].notna() & (df["ATA04"].str.len() >= 5)]
+        if not df.empty and "ATA04" in df.columns:
+            df = df.sort_values(by=["ATA04"]).reset_index(drop=True)
+
     return df
+
 
 def _make_catalog_zip(zip_name: str = None):
     """
     Đóng gói:
     - catalog/ata_catalog.json
-    - catalog/model/* (TF-IDF artifacts)
+    - catalog/model/* (nếu có)
     - data_store/ata_map.parquet, data_store/wo_training.parquet (nếu có)
-    - catalog/catalog_flat.csv (bảng phẳng để review)
+    - catalog/catalog_flat.csv (nếu làm phẳng thành công)
     """
-    if not os.path.isdir("catalog"):
+    cat_dir = "catalog"
+    if not os.path.isdir(cat_dir):
         raise FileNotFoundError("Chưa có thư mục 'catalog/'. Hãy build catalog trước.")
-    json_path = os.path.join("catalog", "ata_catalog.json")
+    json_path = os.path.join(cat_dir, "ata_catalog.json")
     if not os.path.exists(json_path):
         raise FileNotFoundError("Không thấy 'catalog/ata_catalog.json'.")
 
-    df_flat = _flatten_catalog_to_df(json_path)
-    csv_bytes = df_flat.to_csv(index=False).encode("utf-8")
+    # Cố gắng làm phẳng; nếu lỗi thì vẫn tạo zip nhưng bỏ qua CSV
+    csv_bytes = None
+    try:
+        df_flat = _flatten_catalog_to_df(json_path)
+        if not df_flat.empty:
+            csv_bytes = df_flat.to_csv(index=False).encode("utf-8")
+    except Exception as ex:
+        # Không raise để không chặn việc tải gói — chỉ cảnh báo ở UI
+        csv_bytes = None
 
     buf = io.BytesIO()
     if not zip_name:
         zip_name = "catalog_bundle.zip"
 
     with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        # JSON
+        # JSON chính
         zf.write(json_path, arcname="catalog/ata_catalog.json")
-        # Model
-        model_dir = os.path.join("catalog", "model")
+
+        # Model TF-IDF (nếu có)
+        model_dir = os.path.join(cat_dir, "model")
         if os.path.isdir(model_dir):
             for path in glob.glob(os.path.join(model_dir, "**"), recursive=True):
                 if os.path.isfile(path):
                     arc = os.path.relpath(path, ".")
                     zf.write(path, arcname=arc)
-        # Data store (nếu có)
-        ata_map = os.path.join("data_store", "ata_map.parquet")
-        if os.path.exists(ata_map):
-            zf.write(ata_map, arcname="data_store/ata_map.parquet")
-        wo_train = os.path.join("data_store", "wo_training.parquet")
-        if os.path.exists(wo_train):
-            zf.write(wo_train, arcname="data_store/wo_training.parquet")
-        # CSV phẳng
-        zf.writestr("catalog/catalog_flat.csv", csv_bytes)
+
+        # Metadata trong data_store nếu có
+        for fname in ("ata_map.parquet", "wo_training.parquet"):
+            p = os.path.join("data_store", fname)
+            if os.path.exists(p):
+                zf.write(p, arcname=f"data_store/{fname}")
+
+        # CSV làm phẳng (nếu có)
+        if csv_bytes:
+            zf.writestr("catalog/catalog_flat.csv", csv_bytes)
 
     buf.seek(0)
     return buf, zip_name
+
 
 st.markdown("---")
 st.subheader("Kiểm tra & tải Catalog")
@@ -569,5 +656,11 @@ with col2:
                 file_name=zip_name,
                 mime="application/zip",
             )
+            # Thử preview bảng phẳng để báo rõ nếu CSV bị bỏ qua
+            try:
+                df_preview = _flatten_catalog_to_df(str(CAT_JSON))
+                st.info(f"Bảng phẳng có {len(df_preview)} dòng.")
+            except Exception as ex2:
+                st.warning(f"Đã tạo gói nhưng không thể tạo catalog_flat.csv: {ex2}")
         except Exception as e:
             st.error(f"Không thể tạo gói Catalog: {e}")
