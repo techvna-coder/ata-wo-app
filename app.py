@@ -341,7 +341,8 @@ if uploaded is not None:
         e0 = row.get("ATA04_Entered")
 
         # 1) Non-Defect filter
-        is_tech = is_technical_defect(defect, action)
+        wo_type = row.get("WO_Type")
+        is_tech = is_technical_defect(defect, action, wo_type=wo_type)
 
         # 2) E1: citations (trích AMM/TSM/FIM → chuẩn hoá → ATA04)
         citations = extract_citations(f"{defect or ''} {action or ''}")
