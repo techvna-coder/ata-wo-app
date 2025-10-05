@@ -1,221 +1,271 @@
 # core/openai_helpers.py
 from __future__ import annotations
-import os, json, hashlib, time
-from typing import List, Dict, Any, Optional, Tuple
 
-# Hỗ trợ cả SDK mới (v1) và SDK cũ (0.x)
-_SDK_MODE = -1   # -1: không có, 0: legacy 0.x, 1: new 1.x
-_client_v1 = None
-_openai_legacy = None
+import os
+import json
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-def _detect_sdk() -> int:
-    global _SDK_MODE, _client_v1, _openai_legacy
-    if _SDK_MODE != -1:
-        return _SDK_MODE
-    # Thử SDK v1
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # sẽ kiểm tra ở _ensure_openai()
+
+_CLIENT = None
+_DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+
+# ----------------------------
+# Tiện ích & an toàn kiểu dữ liệu
+# ----------------------------
+def _ensure_openai():
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
+    if OpenAI is None:
+        raise RuntimeError("Thư viện openai chưa sẵn sàng.")
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Thiếu OPENAI_API_KEY trong biến môi trường.")
+    _CLIENT = OpenAI(api_key=api_key)
+    return _CLIENT
+
+
+def _is_nan(x: Any) -> bool:
+    # Không nhập pandas; NaN float có tính chất x != x
     try:
-        from openai import OpenAI  # type: ignore
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if not api_key:
-            _SDK_MODE = -1
-            return _SDK_MODE
-        _client_v1 = OpenAI(api_key=api_key)
-        _SDK_MODE = 1
-        return _SDK_MODE
+        return isinstance(x, float) and x != x
     except Exception:
-        pass
-    # Thử SDK legacy 0.x
-    try:
-        import openai as _openai  # type: ignore
-        api_key = os.getenv("OPENAI_API_KEY", "")
-        if not api_key:
-            _SDK_MODE = -1
-            return _SDK_MODE
-        _openai.api_key = api_key
-        globals()["_openai_legacy"] = _openai
-        _SDK_MODE = 0
-        return _SDK_MODE
-    except Exception:
-        _SDK_MODE = -1
-        return _SDK_MODE
+        return False
 
-def has_llm_available() -> bool:
-    """Dùng trong app.py để bật/tắt checkbox LLM đúng thực tế."""
-    return _detect_sdk() in (0, 1)
 
-# ---------------- Cache đơn giản ----------------
-from .llm_cache import cache_get, cache_put
-
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-DEFAULT_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
-DEFAULT_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "500"))
-
-def _hash_key(obj: Any) -> str:
-    raw = json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return hashlib.sha1(raw).hexdigest()
-
-def _chat_completion(messages: List[Dict[str, str]], model: str, temperature: float, max_tokens: int) -> str:
-    """
-    Gọi Chat Completions, tương thích cả SDK v1 và 0.x.
-    Trả về text (assistant content). Ném Exception nếu SDK không có.
-    """
-    mode = _detect_sdk()
-    if mode == 1:
-        # SDK v1
-        resp = _client_v1.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return resp.choices[0].message.content or ""
-    elif mode == 0:
-        # SDK legacy 0.x
-        resp = _openai_legacy.ChatCompletion.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return resp["choices"][0]["message"]["content"]
+def _to_text(x: Any, maxlen: Optional[int] = None) -> str:
+    """Ép bất kỳ giá trị nào thành chuỗi 'an toàn' (loại NaN/None, strip, cắt độ dài)."""
+    if x is None or _is_nan(x):
+        s = ""
+    elif isinstance(x, str):
+        s = x
     else:
-        raise RuntimeError("OpenAI SDK chưa sẵn sàng (chưa cài hoặc thiếu OPENAI_API_KEY).")
+        # Một số kiểu (numpy.*) có __str__ ổn; nếu lỗi thì rỗng
+        try:
+            s = str(x)
+        except Exception:
+            s = ""
+    s = s.strip()
+    if maxlen is not None and maxlen > 0 and len(s) > maxlen:
+        s = s[:maxlen]
+    return s
 
-# ------------------------------------------------------------------
-# 1) LLM arbitration khi REVIEW (chọn trong tập ứng viên hạn chế)
-# ------------------------------------------------------------------
-def llm_arbitrate_when_review(
-    desc: str,
-    action: str,
-    candidates: List[Dict[str, Any]],
-    citations: List[Dict[str, Any]],
-    ata_name_map: Dict[str, str],
-    force_from_candidates: bool = True,
-    model: str = DEFAULT_MODEL,
-    temperature: float = DEFAULT_TEMPERATURE,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-    cache_ttl_sec: int = 30*24*3600,
-) -> Dict[str, Any]:
+
+def _norm_candidates(cands: Any) -> List[str]:
     """
-    Trả về:
-      { "ata04": "21-52", "confidence": 0.90, "rationale": "...", "chosen_from": "citations|tfidf|entered", "evidence_span": "..." }
-    Nếu SDK/OpenAI không sẵn sàng → không raise, trả object rỗng kèm rationale.
+    Chuẩn hoá danh sách ứng viên:
+      - nếu là list[str] => giữ
+      - nếu là list[dict] có khóa 'ata04' => lấy giá trị
+      - bỏ rỗng, bỏ None, loại trùng
     """
-    payload = {
-        "wo": {"desc": (desc or "")[:1500], "action": (action or "")[:1500]},
-        "candidates": (candidates or [])[:5],
-        "citations": (citations or [])[:5],
-        "ata_map": {k: ata_name_map.get(k, "") for k in [c.get("ata04") for c in (candidates or []) if c.get("ata04")]},
-        "rules": {
-            "format": "AA-BB only",
-            "must_choose_from_candidates": bool(force_from_candidates),
-            "tie_break": "citations > symptom match > tfidf score > E0"
-        }
-    }
-    key = _hash_key(payload)
-    hit = cache_get(key)
-    if hit:
-        return hit
+    out: List[str] = []
+    if isinstance(cands, (list, tuple)):
+        for c in cands:
+            if isinstance(c, dict):
+                v = c.get("ata04") or c.get("ATA04") or c.get("code")
+                v = _to_text(v)
+            else:
+                v = _to_text(c)
+            if v:
+                out.append(v)
+    vset = []
+    for v in out:
+        if v not in vset:
+            vset.append(v)
+    return vset
 
-    if not has_llm_available():
-        return {"ata04": "", "confidence": 0.0, "rationale": "LLM not available", "chosen_from": "", "evidence_span": ""}
 
-    system = (
-        "Bạn là chuyên gia bảo dưỡng tàu bay. Nhiệm vụ: chọn đúng MỘT mã ATA 4 ký tự (AA-BB) phù hợp nhất, "
-        "ưu tiên (1) trích dẫn AMM/TSM/FIM hợp lệ, (2) khớp triệu chứng, (3) điểm TF-IDF. "
-        "Chỉ trả JSON: {ata04, confidence, rationale, chosen_from, evidence_span}."
-    )
-    user = json.dumps(payload, ensure_ascii=False)
+def _norm_citations(cits: Any) -> List[str]:
+    """Rút gọn danh sách citations sang chuỗi dễ đọc (ví dụ 'AMM 21-51-00-400-001')."""
+    out: List[str] = []
+    if isinstance(cits, (list, tuple)):
+        for c in cits:
+            if isinstance(c, dict):
+                manual = _to_text(c.get("manual"))
+                task = _to_text(c.get("task"))
+                ata04 = _to_text(c.get("ata04"))
+                s = " ".join([p for p in [manual, task, ata04] if p])
+                s = s.strip()
+            else:
+                s = _to_text(c)
+            if s:
+                out.append(s)
+    return out[:6]
 
-    try:
-        text = _chat_completion(
-            model=model,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
-    except Exception as e:
-        return {"ata04": "", "confidence": 0.0, "rationale": f"LLM error: {e}", "chosen_from": "", "evidence_span": ""}
 
-    # Parse JSON
-    ata04 = ""
-    conf = 0.0
-    rationale = ""
-    chosen_from = ""
-    evidence_span = ""
-    try:
-        obj = json.loads(text)
-        ata04 = (obj.get("ata04") or "").strip().upper()
-        conf = float(obj.get("confidence") or 0.0)
-        rationale = obj.get("rationale") or ""
-        chosen_from = obj.get("chosen_from") or ""
-        evidence_span = obj.get("evidence_span") or ""
-    except Exception:
-        rationale = f"Unparseable JSON: {text}"
+def _ata_name(ata: str, ata_name_map: Optional[Dict[str, str]]) -> str:
+    if not ata_name_map:
+        return ""
+    return _to_text(ata_name_map.get(ata))
 
-    # Chuẩn hoá AA-BB
-    def _fix(ata: str) -> str:
-        if not ata: return ata
-        ata = ata.replace(" ", "")
-        if "-" in ata:
-            a, b = ata.split("-", 1)
-            return f"{a[:2]}-{b[:2]}"
-        if ata.isdigit() and len(ata) >= 4:
-            return f"{ata[:2]}-{ata[2:4]}"
-        return ata
-    ata04 = _fix(ata04)
 
-    # Ép phải thuộc tập ứng viên nếu cờ bật
-    set_cands = { (c.get("ata04") or "").upper() for c in (candidates or []) if c.get("ata04") }
-    if force_from_candidates and ata04 not in set_cands and set_cands:
-        ata04 = (candidates[0].get("ata04") or "").upper()
-        chosen_from = chosen_from or "tfidf"
-
-    out = {
-        "ata04": ata04,
-        "confidence": max(0.0, min(1.0, conf)),
-        "rationale": (rationale or "")[:1200],
-        "chosen_from": chosen_from,
-        "evidence_span": (evidence_span or "")[:600],
-        "ts": int(time.time()),
-    }
-    cache_put(key, out, ttl_sec=cache_ttl_sec)
-    return out
-
-# ------------------------------------------------------------------
-# 2) API cũ để gợi ý đơn mã (giữ tương thích)
-# ------------------------------------------------------------------
+# ----------------------------
+# 1) Gợi ý ATA khi mơ hồ (đơn giản)
+# ----------------------------
 def llm_suggest_ata(
     defect_text: str,
-    rect_text: str,
+    action_text: str,
     top_candidates: Optional[List[str]] = None,
     cited_refs: Optional[List[str]] = None,
-    model: str = DEFAULT_MODEL,
-    temperature: float = DEFAULT_TEMPERATURE,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-) -> Dict[str, Any]:
-    if not has_llm_available():
-        return {"ata04": "", "confidence": 0.0, "reason": "LLM not available"}
-    system = "Bạn là chuyên gia bảo dưỡng tàu bay. Hãy đề xuất một mã ATA 4 ký tự (AA-BB) phù hợp nhất."
-    user = {
-        "desc": (defect_text or "")[:1500],
-        "action": (rect_text or "")[:1500],
-        "candidates": top_candidates or [],
-        "cited_refs": cited_refs or [],
-        "rules": {"format": "AA-BB recommended"}
+    model: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Dùng LLM để đề xuất 1 ATA04 khi pipeline TF-IDF mơ hồ.
+    Trả về: {"ata04": "...", "reason": "...", "used_model": "..."} hoặc None.
+    """
+    client = _ensure_openai()
+    model = model or _DEFAULT_MODEL
+
+    desc = _to_text(defect_text, 2000)
+    act  = _to_text(action_text, 2000)
+    cands = _norm_candidates(top_candidates or [])
+    refs  = _norm_citations(cited_refs or [])
+
+    sys = (
+        "Bạn là kỹ sư khai thác/độ tin cậy. Hãy chọn 1 mã ATA04 phù hợp nhất với mô tả WO "
+        "(ưu tiên trong danh sách ứng viên nếu có). Trả về JSON {'ata04': 'AA-BB', 'reason': '...'}."
+    )
+    user_payload = {
+        "wo": {"desc": desc, "action": act},
+        "candidates": cands,
+        "cited_refs": refs,
+        "rule_of_thumb": [
+            "Ưu tiên mã ATA xuất hiện trong trích dẫn AMM/TSM/FIM (nếu có).",
+            "Nếu không có trích dẫn, chọn ứng viên gần nhất theo triệu chứng và LRU được nhắc.",
+            "Không bịa mã, không trả về rỗng. Nếu bất khả kháng, trả về ứng viên đầu tiên và nêu lý do."
+        ],
     }
+
     try:
-        text = _chat_completion(
+        rsp = client.chat.completions.create(
             model=model,
-            messages=[{"role":"system","content":system},{"role":"user","content":json.dumps(user, ensure_ascii=False)}],
-            temperature=temperature,
-            max_tokens=max_tokens
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
         )
-        obj = json.loads(text)
-        return {
-            "ata04": obj.get("ata04"),
-            "confidence": obj.get("confidence", 0.0),
-            "reason": obj.get("reason", "")
+        txt = rsp.choices[0].message.content.strip()
+        # Tìm JSON trong câu trả lời
+        try:
+            if txt.startswith("{"):
+                data = json.loads(txt)
+            else:
+                # Thử tìm khối JSON
+                lb = txt.find("{")
+                rb = txt.rfind("}")
+                data = json.loads(txt[lb:rb+1]) if (lb >= 0 and rb >= 0 and rb > lb) else {}
+        except Exception:
+            data = {}
+        ata = _to_text(data.get("ata04"))
+        reason = _to_text(data.get("reason"))
+        if ata:
+            return {"ata04": ata, "reason": reason, "used_model": model}
+        # fallback: nếu có candidates
+        if cands:
+            return {"ata04": cands[0], "reason": "Fallback: chọn ứng viên đầu.", "used_model": model}
+        return None
+    except Exception:
+        # Nếu LLM lỗi, trả None để caller tự xử lý
+        return None
+
+
+# ----------------------------
+# 2) Trọng tài khi REVIEW (ưu tiên candidates)
+# ----------------------------
+def llm_arbitrate_when_review(
+    desc: Any,
+    action: Any,
+    candidates: Optional[List[Union[str, Dict[str, Any]]]],
+    citations: Optional[List[Any]] = None,
+    ata_name_map: Optional[Dict[str, str]] = None,
+    force_from_candidates: bool = True,
+    model: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Dùng LLM khi Decision=REVIEW. Trả về:
+      {"ata04": "...", "reason": "...", "used_model": "...", "candidate_used": True/False}
+    """
+    client = _ensure_openai()
+    model = model or _DEFAULT_MODEL
+
+    # Ép an toàn mọi trường
+    s_desc = _to_text(desc, 3000)
+    s_act  = _to_text(action, 3000)
+    cands  = _norm_candidates(candidates or [])
+    cits   = _norm_citations(citations or [])
+
+    # Kèm tên hệ thống nếu có
+    cand_with_names = [{"ata04": c, "name": _ata_name(c, ata_name_map)} for c in cands]
+
+    sys = (
+        "Bạn là chuyên gia phân loại ATA cho WO. Nhiệm vụ: chọn đúng 1 mã ATA04 "
+        "từ danh sách ứng viên (nếu danh sách không rỗng) dựa trên mô tả defect và action. "
+        "Nếu danh sách rỗng, bạn có thể đề xuất mã hợp lý nhất, nhưng phải nêu lý do và không bịa đặt.\n"
+        "Trả về JSON: {'ata04': 'AA-BB', 'reason': '...'}."
+    )
+    user_payload = {
+        "wo": {"desc": s_desc, "action": s_act},
+        "candidates": cand_with_names,
+        "citations": cits,
+        "policy": {
+            "force_from_candidates": bool(force_from_candidates),
+            "tie_break": "ưu tiên ứng viên trùng với ATA trong trích dẫn; nếu vẫn hoà, ưu tiên candidate có tên hệ thống phù hợp ngữ cảnh."
         }
-    except Exception as e:
-        return {"ata04": "", "confidence": 0.0, "reason": f"LLM error: {e}"}
+    }
+
+    try:
+        rsp = client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            ],
+        )
+        txt = rsp.choices[0].message.content.strip()
+        try:
+            if txt.startswith("{"):
+                data = json.loads(txt)
+            else:
+                lb = txt.find("{")
+                rb = txt.rfind("}")
+                data = json.loads(txt[lb:rb+1]) if (lb >= 0 and rb >= 0 and rb > lb) else {}
+        except Exception:
+            data = {}
+
+        ata = _to_text(data.get("ata04"))
+        reason = _to_text(data.get("reason"))
+        if ata:
+            used = ata in cands if cands else False
+            return {
+                "ata04": ata,
+                "reason": reason,
+                "used_model": model,
+                "candidate_used": used
+            }
+
+        # fallback hợp lệ nếu ép phải chọn trong candidates
+        if force_from_candidates and cands:
+            return {
+                "ata04": cands[0],
+                "reason": "Fallback: chọn ứng viên đầu do không parse được đầu ra LLM.",
+                "used_model": model,
+                "candidate_used": True
+            }
+        return None
+    except Exception:
+        # Nếu call lỗi, fallback tối thiểu
+        if force_from_candidates and cands:
+            return {
+                "ata04": cands[0],
+                "reason": "Fallback offline: lỗi gọi LLM, dùng ứng viên đầu.",
+                "used_model": model,
+                "candidate_used": True
+            }
+        return None
