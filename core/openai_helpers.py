@@ -1,164 +1,219 @@
 # core/openai_helpers.py
 from __future__ import annotations
-import os, time, json
-from typing import Dict, Any, List, Optional
+import os, json, hashlib, time
+from typing import List, Dict, Any, Optional, Tuple
 
-# Hỗ trợ OpenAI SDK v1.x
 try:
-    from openai import OpenAI
+    import openai
 except Exception:
-    OpenAI = None
+    openai = None
 
-# =========================
-# Cấu hình & tiện ích
-# =========================
-def _client() -> Optional["OpenAI"]:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key or OpenAI is None:
-        return None
+from .llm_cache import cache_get, cache_put
+
+# ----- Cấu hình mặc định -----
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.2"))
+DEFAULT_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "500"))
+
+def _ensure_openai():
+    if openai is None:
+        raise RuntimeError("Thư viện openai chưa sẵn sàng.")
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("Thiếu OPENAI_API_KEY trong biến môi trường.")
+    openai.api_key = api_key
+
+def _hash_key(obj: Any) -> str:
+    raw = json.dumps(obj, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+# ------------------------------------------------------------------
+# 1) LLM arbitration khi REVIEW (chọn trong tập ứng viên hạn chế)
+# ------------------------------------------------------------------
+def llm_arbitrate_when_review(
+    desc: str,
+    action: str,
+    candidates: List[Dict[str, Any]],
+    citations: List[Dict[str, Any]],
+    ata_name_map: Dict[str, str],
+    force_from_candidates: bool = True,
+    model: str = DEFAULT_MODEL,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    cache_ttl_sec: int = 30*24*3600,
+) -> Dict[str, Any]:
+    """
+    Trả về:
+      {
+        "ata04": "21-52",
+        "confidence": 0.90,
+        "rationale": "...",
+        "chosen_from": "citations|tfidf|entered",
+        "evidence_span": "..."
+      }
+    - Luôn ưu tiên chọn trong 'candidates' (force_from_candidates=True)
+    - Có cache theo sha1(desc|action|candidates|citations|ata_name_map)
+    """
+    payload = {
+        "wo": {"desc": (desc or "")[:1500], "action": (action or "")[:1500]},
+        "candidates": candidates[:5] if candidates else [],
+        "citations": citations[:5] if citations else [],
+        "ata_map": {k: ata_name_map.get(k, "") for k in [c.get("ata04") for c in (candidates or []) if c.get("ata04")]},
+        "rules": {
+            "format": "AA-BB only",
+            "must_choose_from_candidates": bool(force_from_candidates),
+            "tie_break": "citations > symptom match > tfidf score > E0"
+        }
+    }
+    key = _hash_key(payload)
+    hit = cache_get(key)
+    if hit:
+        return hit
+
+    _ensure_openai()
+
+    system = (
+        "Bạn là chuyên gia bảo dưỡng tàu bay. Nhiệm vụ: chọn đúng MỘT mã ATA 4 ký tự (AA-BB) phù hợp nhất, "
+        "ưu tiên theo: (1) trích dẫn AMM/TSM/FIM hợp lệ, (2) khớp triệu chứng với tiêu đề/từ khóa ATA, (3) điểm TF-IDF. "
+        "Trả về JSON theo schema: {ata04, confidence, rationale, chosen_from, evidence_span}. "
+        "Không trả văn bản ngoài JSON."
+    )
+    user = json.dumps(payload, ensure_ascii=False)
+
+    # Dùng Chat Completions (tương thích)
     try:
-        return OpenAI(api_key=api_key)
+        resp = openai.ChatCompletion.create(
+            model=model,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        text = resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        # Khi lỗi model, trả về rỗng
+        return {"ata04": "", "confidence": 0.0, "rationale": f"LLM error: {e}", "chosen_from": "", "evidence_span": ""}
+
+    # Parse JSON
+    ata04 = ""
+    conf = 0.0
+    rationale = ""
+    chosen_from = ""
+    evidence_span = ""
+    try:
+        obj = json.loads(text)
+        ata04 = (obj.get("ata04") or "").strip().upper()
+        conf = float(obj.get("confidence") or 0.0)
+        rationale = obj.get("rationale") or ""
+        chosen_from = obj.get("chosen_from") or ""
+        evidence_span = obj.get("evidence_span") or ""
     except Exception:
-        return None
+        rationale = f"Unparseable JSON: {text}"
 
-def _safe_truncate(txt: str, limit: int) -> str:
-    if not txt:
-        return ""
-    txt = str(txt)
-    return txt[:limit]
+    # Chuẩn hoá AA-BB
+    def _fix(ata: str) -> str:
+        if not ata: return ata
+        ata = ata.replace(" ", "")
+        if "-" in ata:
+            a,b = ata.split("-",1)
+            return f"{a[:2]}-{b[:2]}"
+        if ata.isdigit() and len(ata) >= 4:
+            return f"{ata[:2]}-{ata[2:4]}"
+        return ata
+    ata04 = _fix(ata04)
 
-def _retry(fn, retries=2, backoff=1.5):
-    last = None
-    for i in range(retries + 1):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            time.sleep(backoff ** (i + 1))
-    raise last
+    # Nếu ép phải nằm trong candidates, kiểm tra và ràng buộc
+    set_cands = { (c.get("ata04") or "").upper() for c in (candidates or []) if c.get("ata04") }
+    if force_from_candidates and ata04 not in set_cands and set_cands:
+        # Nếu LLM chọn ngoài tập → ràng buộc về top-1 TF-IDF
+        # Hoặc chọn ứng viên có mention trong rationale/evidence
+        top1 = candidates[0].get("ata04") if candidates else ""
+        ata04 = top1 or ata04
+        chosen_from = chosen_from or "tfidf"
 
-# =========================
-# Fallback gợi ý ATA04
-# =========================
+    out = {
+        "ata04": ata04,
+        "confidence": max(0.0, min(1.0, conf)),
+        "rationale": rationale[:1200],
+        "chosen_from": chosen_from,
+        "evidence_span": evidence_span[:600],
+        "ts": int(time.time()),
+    }
+    cache_put(key, out, ttl_sec=cache_ttl_sec)
+    return out
+
+# ------------------------------------------------------------------
+# 2) API cũ để gợi ý đơn mã (không bắt buộc candidates)
+# ------------------------------------------------------------------
 def llm_suggest_ata(
     defect_text: str,
     rect_text: str,
     top_candidates: Optional[List[str]] = None,
     cited_refs: Optional[List[str]] = None,
-    model: str = "gpt-4o-mini",
-) -> Optional[Dict[str, Any]]:
+    model: str = DEFAULT_MODEL,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> Dict[str, Any]:
     """
-    Trả về gợi ý {"ata04": "AA-BB", "reason": "..."} hoặc None nếu không khả dụng.
-    Gửi tối thiểu dữ liệu, đã rút gọn.
+    Giữ tương thích ngược: chỉ trả 1 mã đề xuất từ ngữ cảnh. Không ràng buộc candidates.
     """
-    cli = _client()
-    if cli is None:
-        return None
-
-    defect_text = _safe_truncate(defect_text or "", 1200)
-    rect_text   = _safe_truncate(rect_text or "", 1200)
-    cand_txt = ", ".join(top_candidates or [])[:200] if top_candidates else ""
-    refs_txt = "; ".join(cited_refs or [])[:250] if cited_refs else ""
-
-    system = (
-        "Bạn là kỹ sư bảo dưỡng máy bay. Nhiệm vụ: xác định mã ATA 04 (dạng AA-BB) "
-        "phù hợp nhất cho mô tả WO. Ưu tiên dựa vào triệu chứng/symptom, chỉ dấu ECAM/EICAS/CAS, "
-        "và tham chiếu AMM/TSM/FIM (nếu có). Xuất JSON ngắn gọn."
-    )
+    _ensure_openai()
+    system = ("Bạn là chuyên gia bảo dưỡng tàu bay. Hãy đề xuất một mã ATA 4 ký tự (AA-BB) phù hợp nhất với mô tả/hành động.")
     user = {
-        "wo_defect": defect_text,
-        "wo_action": rect_text,
-        "top_candidates": top_candidates or [],
-        "cited": refs_txt,
-        "output": "Trả về JSON dạng: {\"ata04\": \"AA-BB\", \"reason\": \"...\"}."
+        "desc": (defect_text or "")[:1500],
+        "action": (rect_text or "")[:1500],
+        "candidates": top_candidates or [],
+        "cited_refs": cited_refs or [],
+        "rules": {"format": "AA-BB recommended"}
     }
-
-    def _call():
-        resp = cli.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
-            ],
-            temperature=0.1,
-            max_tokens=150,
-        )
-        return resp
-
     try:
-        resp = _retry(_call)
-        txt = resp.choices[0].message.content or ""
-        # tìm JSON trong câu trả lời
-        start = txt.find("{")
-        end   = txt.rfind("}")
-        if start >= 0 and end > start:
-            js = json.loads(txt[start:end+1])
-            ata = js.get("ata04")
-            reason = js.get("reason", "")
-            if isinstance(ata, str) and len(ata) >= 5:
-                return {"ata04": ata.strip(), "reason": str(reason)[:500]}
-    except Exception:
-        return None
-    return None
-
-# =========================
-# Làm giàu Catalog (title/keywords)
-# =========================
-def llm_enrich_catalog_entry(
-    ata04: str,
-    samples: List[str],
-    title_hint: str = "",
-    model: str = "gpt-4o-mini",
-    top_k: int = 12,
-) -> Optional[Dict[str, Any]]:
-    """
-    Từ vài câu mẫu + title_hint (nếu có), sinh:
-      {"title": "...", "keywords": ["..."], "samples": ["..."]}  (keywords <= top_k)
-    """
-    cli = _client()
-    if cli is None:
-        return None
-
-    samples = [ _safe_truncate(s, 240) for s in (samples or []) ][:5]
-
-    system = (
-        "Bạn là chuyên gia hệ thống máy bay. Hãy đặt tiêu đề hệ thống ngắn gọn, "
-        "chuẩn ATA và liệt kê từ khóa đặc trưng (symptom, ECAM/EICAS/CAS cues, LRUs) "
-        "cho lớp ATA04 được cung cấp."
-    )
-    user = {
-        "ata04": ata04,
-        "title_hint": _safe_truncate(title_hint or "", 120),
-        "samples": samples,
-        "need": f"Trả JSON: {{\"title\": \"...\", \"keywords\": [<= {top_k} từ/cụm], \"samples\": [<=3 câu chọn lại]}}"
-    }
-
-    def _call():
-        return cli.chat.completions.create(
+        resp = openai.ChatCompletion.create(
             model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
-            ],
-            temperature=0.2,
-            max_tokens=300,
+            messages=[{"role":"system","content":system},{"role":"user","content":json.dumps(user, ensure_ascii=False)}],
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
+        text = resp["choices"][0]["message"]["content"]
+        obj = json.loads(text)
+        return {
+            "ata04": obj.get("ata04"),
+            "confidence": obj.get("confidence", 0.0),
+            "reason": obj.get("reason", "")
+        }
+    except Exception as e:
+        return {"ata04": "", "confidence": 0.0, "reason": f"LLM error: {e}"}
 
-    try:
-        resp = _retry(_call)
-        txt = resp.choices[0].message.content or ""
-        start = txt.find("{")
-        end   = txt.rfind("}")
-        if start >= 0 and end > start:
-            js = json.loads(txt[start:end+1])
-            title = str(js.get("title", "")).strip()
-            kws   = [str(k).strip() for k in (js.get("keywords") or []) if str(k).strip()]
-            sps   = [str(s).strip() for s in (js.get("samples") or []) if str(s).strip()]
-            return {
-                "title": title[:120],
-                "keywords": kws[:top_k],
-                "samples": sps[:3],
-            }
-    except Exception:
-        return None
-    return None
+# ------------------------------------------------------------------
+# 3) Làm giàu Catalog (tuỳ chọn khi build)
+# ------------------------------------------------------------------
+def enrich_catalog_entries(
+    ata_samples: Dict[str, List[str]],
+    model: str = DEFAULT_MODEL,
+    temperature: float = 0.2,
+    max_tokens: int = 400,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    ata_samples: {"21-52": ["desc1 ... action1", "desc2 ... action2", ...], ...}
+    trả về: {"21-52": {"keywords": [...], "samples": [...]} }
+    """
+    _ensure_openai()
+    out = {}
+    for ata, texts in ata_samples.items():
+        j = {"ata04": ata, "examples": [t[:800] for t in texts[:5]]}
+        system = ("Chuẩn hoá từ khóa & câu mô tả mẫu cho mã ATA. "
+                  "Trả JSON: {keywords:[...], samples:[...]} ngắn gọn, kỹ thuật, không riêng máy bay cụ thể.")
+        try:
+            resp = openai.ChatCompletion.create(
+                model=model,
+                messages=[{"role":"system","content":system},{"role":"user","content":json.dumps(j, ensure_ascii=False)}],
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            text = resp["choices"][0]["message"]["content"]
+            obj = json.loads(text)
+            kws = obj.get("keywords", [])
+            sents = obj.get("samples", [])
+            if isinstance(kws, list) and isinstance(sents, list):
+                out[ata] = {"keywords": [str(x) for x in kws][:20], "samples": [str(x) for x in sents][:10]}
+        except Exception:
+            continue
+    return out
