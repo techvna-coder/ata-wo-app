@@ -341,16 +341,23 @@ if uploaded is not None:
     results = []
     citations_example = None
 
+    from core.openai_helpers import llm_arbitrate_when_review  # dùng arbitration mới
+    
+    # ...
+    
+    results = []
+    citations_example = None
+    
     for _, row in df.iterrows():
         defect = row.get("Defect_Text")
         action = row.get("Rectification_Text")
         e0 = row.get("ATA04_Entered")
-
+    
         # 1) Non-Defect filter
         wo_type = row.get("WO_Type")
         is_tech = is_technical_defect(defect, action, wo_type=wo_type)
-
-        # 2) E1: citations (trích AMM/TSM/FIM → chuẩn hoá → ATA04)
+    
+        # 2) E1: trích dẫn (AMM/TSM/FIM)
         citations = extract_citations(f"{defect or ''} {action or ''}")
         if citations and citations_example is None:
             citations_example = citations[:]
@@ -359,55 +366,88 @@ if uploaded is not None:
             if c.get("ata04"):
                 e1_valid = True
                 e1_ata = c["ata04"]
-                cited_manual = c["manual"]
-                cited_task = c["task"]
+                cited_manual = c.get("manual")
+                cited_task = c.get("task")
                 break
-
-        # 3) E2: Catalog
+    
+        # 3) E2: Catalog (Top-K cho LLM)
         e2_best = None
+        e2_all = []
         derived_task = derived_doc = derived_score = evidence_snip = evidence_src = None
-        if use_catalog and catalog and is_tech:
-            e2_best, _ = catalog.predict(defect, action)
-            if e2_best:
-                derived_task = e2_best.get("ata04")
-                derived_doc  = e2_best.get("doc")
-                derived_score= e2_best.get("score")
-                evidence_snip= e2_best.get("snippet")
-                evidence_src = e2_best.get("source")
-
-        # 4) Decision (tam-đối-soát)
+        ata_name_map = {}
+        if use_catalog:
+            if catalog and is_tech:
+                e2_best, e2_all = catalog.predict(defect, action)   # best, list
+                if e2_best:
+                    derived_task = e2_best.get("ata04")
+                    derived_doc  = e2_best.get("doc")
+                    derived_score= e2_best.get("score")
+                    evidence_snip= e2_best.get("snippet")
+                    evidence_src = e2_best.get("source")
+                ata_name_map = catalog.name_map()
+    
+        # 4) Tam-đối-soát
         decision, conf, reason = decide(
             e0=(e0 if isinstance(e0, str) and len(e0) >= 5 else None),
             e1_valid=(is_tech and e1_valid),
             e1_ata=e1_ata,
             e2_best=e2_best,
-            e2_all=None
+            e2_all=e2_all
         )
         ata_final = (e1_ata or derived_task or e0) if decision in ("CONFIRM", "CORRECT") else (derived_task or e1_ata or e0)
-
-        # 5) Fallback bằng LLM nếu mơ hồ/không xác định (tùy chọn)
+    
+        # 5) LLM arbitration khi REVIEW & Technical Defect
         llm_used = False
-        llm_reason = None
-        if use_llm_fallback and HAS_LLM and is_tech:
-            ambiguous = (decision == "REVIEW") or (conf is not None and conf < float(low_conf_thresh)) or (not (e1_ata or derived_task))
-            if ambiguous:
-                top_candidates = []
-                if isinstance(e2_best, dict) and e2_best.get("ata04"):
-                    top_candidates = [e2_best.get("ata04")]
-                cited_refs = []
-                if cited_manual and cited_task:
-                    cited_refs.append(f"{cited_manual} {cited_task}")
-
-                sugg = llm_suggest_ata(defect or "", action or "", top_candidates=top_candidates, cited_refs=cited_refs)
-                if sugg and isinstance(sugg.get("ata04"), str):
-                    ata_llm = sugg["ata04"]
-                    llm_reason = sugg.get("reason", "")
-                    ata_final = ata_llm
+        if use_llm_fallback and HAS_LLM and is_tech and decision == "REVIEW":
+            # Chuẩn bị tập ứng viên cho LLM: E1 + Top-K + E0
+            uniq = {}
+            # E1 (nếu có)
+            if e1_ata:
+                uniq[e1_ata.upper()] = {"ata04": e1_ata.upper(), "why": "citation", "score": 1.0, "snippet": "", "source": "citation"}
+            # E2 all
+            for c in (e2_all or []):
+                a = (c.get("ata04") or "").upper()
+                if a and a not in uniq:
+                    uniq[a] = {"ata04": a, "why": "tfidf", "score": float(c.get("score") or 0.0),
+                               "snippet": c.get("snippet"), "source": c.get("source")}
+            # E0 (nếu hợp lệ)
+            if isinstance(e0, str) and len(e0) >= 4:
+                a0 = e0.strip().upper()
+                if a0 not in uniq:
+                    uniq[a0] = {"ata04": a0, "why": "entered", "score": 0.5, "snippet": "", "source": "entered"}
+    
+            cand_list = sorted(uniq.values(), key=lambda x: (-float(x.get("score") or 0.0), x.get("why","")))
+            # citations compact (đưa cho LLM)
+            cits = []
+            for c in (citations or [])[:5]:
+                cits.append({
+                    "manual": c.get("manual"),
+                    "task": c.get("task"),
+                    "ata04": c.get("ata04")
+                })
+    
+            arb = llm_arbitrate_when_review(
+                desc=defect or "", action=action or "",
+                candidates=cand_list[:5], citations=cits, ata_name_map=ata_name_map,
+                force_from_candidates=True
+            )
+            a_llm = (arb.get("ata04") or "").upper()
+            if a_llm:
+                llm_used = True
+                ata_final = a_llm
+                chosen_from = arb.get("chosen_from") or ""
+                # Hiệu chỉnh confidence
+                conf_llm = float(arb.get("confidence") or 0.0)
+                # đặt sàn cao hơn khi LLM chọn đúng E1
+                if a_llm == (e1_ata or "").upper():
+                    conf = max(conf or 0.0, 0.92, conf_llm)
+                    decision = "CONFIRM"
+                else:
+                    conf = max(conf or 0.0, 0.86, conf_llm)
                     decision = "CORRECT" if ata_final and ata_final != (e0 or "") else "CONFIRM"
-                    conf = max(conf or 0.0, 0.86)
-                    reason = (reason + " | LLM assist: " + llm_reason)[:900]
-                    llm_used = True
-
+                reason = (reason or "")
+                reason = (reason + f" | LLM arbitration: {arb.get('rationale','')[:300]}").strip()
+    
         results.append({
             "Is_Technical_Defect": bool(is_tech),
             "ATA04_Entered": e0,
