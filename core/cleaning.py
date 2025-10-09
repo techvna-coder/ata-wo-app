@@ -147,7 +147,7 @@ def clean_text_block(s: str) -> str:
 
 def clean_wo_text(s: str) -> str:
     """
-    Alias cho clean_text_block để tương thích phiên bản mới anh đang dùng.
+    Alias cho clean_text_block để tương thích phiên bản mới.
     """
     return clean_text_block(s)
 
