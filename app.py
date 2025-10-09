@@ -361,19 +361,33 @@ if uploaded is not None:
                 evidence_src[i]  = best.get("source")
 
     # 5) Quyết định + LLM fallback (giới hạn số cuộc gọi)
+   
     results = []
     llm_calls = 0
     ata_name_map = None
+    
     # Lấy bản đồ tên ATA nếu có (không bắt buộc)
     try:
         if catalog and hasattr(catalog, "name_map"):
             ata_name_map = catalog.name_map()
     except Exception:
         ata_name_map = None
-
+    
     for i in range(len(df)):
-        e0 = df.at[i, "ATA04_Entered"] if "ATA04_Entered" in df.columns else None
-        e1 = cited_ata[i]
+        # ========== GATHER EVIDENCE (E0, E1, E2) ==========
+        
+        # E0: ATA Entered (RAW - không filter, để decide() tự validate)
+        e0_raw = df.at[i, "ATA04_Entered"] if "ATA04_Entered" in df.columns else None
+        if pd.isna(e0_raw):
+            e0_raw = None
+        else:
+            e0_raw = str(e0_raw).strip()
+        
+        # E1: Citation extracted (chỉ valid nếu là technical defect VÀ có citation)
+        e1_ata = cited_ata[i]
+        e1_valid = bool(tech_mask[i]) and bool(e1_ata) and isinstance(e1_ata, str) and len(e1_ata) >= 4
+        
+        # E2: Catalog prediction
         e2_best = None
         if derived_task[i]:
             e2_best = {
@@ -383,17 +397,20 @@ if uploaded is not None:
                 "snippet": evidence_snip[i],
                 "source": evidence_src[i],
             }
-
+        
+        # ========== DECISION LOGIC ==========
         decision, conf, reason = decide(
-            e0=(e0 if isinstance(e0, str) and len(e0) >= 5 else None),
-            e1_valid=(bool(tech_mask[i]) and bool(e1)),
-            e1_ata=e1,
+            e0=e0_raw,  # ← KHÔNG FILTER, truyền raw value
+            e1_valid=e1_valid,
+            e1_ata=e1_ata,
             e2_best=e2_best,
             e2_all=None
         )
-        ata_final = (e1 or (e2_best.get("ata04") if e2_best else None) or e0)
-
-        # LLM chỉ khi cần thiết & còn quota
+        
+        # Xác định ATA_Final (ưu tiên E1 > E2 > E0)
+        ata_final = e1_ata or (e2_best.get("ata04") if e2_best else None) or e0_raw
+        
+        # ========== LLM FALLBACK (chỉ khi cần thiết & còn quota) ==========
         llm_used = False
         ambiguous = (
             bool(tech_mask[i]) and
@@ -401,16 +418,17 @@ if uploaded is not None:
             (decision == "REVIEW" or (conf is not None and conf < float(low_conf_thresh)) or not ata_final) and
             (llm_calls < int(max_llm_calls))
         )
+        
         if ambiguous:
             # Ứng viên (ràng buộc LLM để ổn định)
             cands = []
-            if e1:
-                cands.append({"ata04": e1, "why": "citation", "score": 1.0})
+            if e1_valid and e1_ata:
+                cands.append({"ata04": e1_ata, "why": "citation", "score": 1.0})
             if e2_best and e2_best.get("ata04"):
                 cands.append({"ata04": e2_best.get("ata04"), "why": "tfidf", "score": float(e2_best.get("score") or 0.0)})
-            if isinstance(e0, str) and len(e0) >= 4:
-                cands.append({"ata04": e0.strip(), "why": "entered", "score": 0.5})
-
+            if e0_raw and isinstance(e0_raw, str) and len(e0_raw) >= 4:
+                cands.append({"ata04": e0_raw.strip(), "why": "entered", "score": 0.5})
+            
             # Loại trùng và sắp xếp
             uniq = {}
             for c in cands:
@@ -418,12 +436,13 @@ if uploaded is not None:
                 if key and key not in uniq:
                     uniq[key] = c
             cand_list = sorted(uniq.values(), key=lambda x: -float(x.get("score") or 0.0))
-
+            
+            # Citations
             cits = []
             if citations_cache[i]:
                 for c in citations_cache[i][:5]:
                     cits.append({"manual": c.get("manual"), "task": c.get("task"), "ata04": c.get("ata04")})
-
+            
             try:
                 arb = llm_arbitrate_when_review(
                     desc=descs[i] or "", action=acts[i] or "",
@@ -435,22 +454,27 @@ if uploaded is not None:
                     llm_used = True
                     ata_final = a_llm
                     conf_llm = float(arb.get("confidence") or 0.0)
-                    if a_llm == (e1 or "").upper():
+                    
+                    # Adjust decision based on LLM result
+                    if a_llm == (e1_ata or "").upper():
                         conf = max(conf or 0.0, 0.92, conf_llm)
                         decision = "CONFIRM"
                     else:
                         conf = max(conf or 0.0, 0.88, conf_llm)
-                        decision = "CORRECT" if ata_final and ata_final != (e0 or "") else "CONFIRM"
+                        decision = "CORRECT" if ata_final and ata_final != (e0_raw or "") else "CONFIRM"
+                    
                     reason = (reason or "")
                     reason = (reason + f" | LLM arbitration: {arb.get('rationale','')[:300]}").strip()
                     llm_calls += 1
-            except Exception:
-                pass
-
+            except Exception as e:
+                if show_debug:
+                    st.warning(f"LLM call failed for row {i}: {e}")
+        
+        # ========== STORE RESULT ==========
         results.append({
             "Is_Technical_Defect": bool(tech_mask[i]),
-            "ATA04_Entered": e0,
-            "ATA04_From_Cited": e1,
+            "ATA04_Entered": e0_raw,
+            "ATA04_From_Cited": e1_ata,
             "Cited_Manual": cited_manual[i],
             "Cited_Task": cited_task[i],
             "Cited_Exists": False,
@@ -466,8 +490,10 @@ if uploaded is not None:
             "Reason": reason,
             "LLM_Used": llm_used,
         })
-
+    
     res_df = pd.DataFrame(results)
+
+
 
     # 6) Ghép ra Excel – chỉ THÊM cột, giữ nguyên cột gốc & tiêu đề
     out_df = raw_df.copy()
