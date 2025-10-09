@@ -4,10 +4,11 @@ from .constants import ATA_PATTERN
 
 # Pattern mở rộng hỗ trợ:
 # - Suffix revision: -A, -B, -001A, etc.
-# - Flexible separators: space, dash, colon
+# - Flexible separators: space, dash, colon (including "AMM:", "AMM :", "REF AMM:")
 # - Date parentheses: (AUG 01 2025)
+# - Prefix keywords: REF, PER, IAW, etc.
 REF_PATTERN = re.compile(
-    r"\b(?P<manual>TSM|FIM|AMM|ESPM)\s*[-:\s]?\s*"
+    r"(?:\b(?:REF|PER|IAW)\s+)?(?P<manual>TSM|FIM|AMM|ESPM)\s*[:;\s-]*\s*"
     r"(?P<seq>(\d{2}[- ]?\d{2}([- ]?\d{2})?([- ]?\d{2,})?([- ]?[A-Z])?))"
     r"(\s*\([^)]{1,20}\))?",  # Optional date/revision in parentheses
     flags=re.I,
@@ -91,9 +92,12 @@ if __name__ == "__main__":
     test_cases = [
         "REF AMM 21-21-44-000-001-A (AUG 01 2025)",
         "AMM 21-21-44-400-001-A (AUG 01 2025)",
+        "REF AMM: 21-52-24-000-001-A (AUG 01 2025)",  # NEW: với dấu hai chấm
+        "AMM: 21-52-24-400-001-A",                    # NEW: format ngắn
         "TSM 32-41-00-400-801",
         "FIM 24 11 00 001",
         "REF: AMM 212144000001B",
+        "PER AMM 21-11-00-001",                       # NEW: PER prefix
     ]
     
     print("=== CITATION EXTRACTION TEST ===\n")
