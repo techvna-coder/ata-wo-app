@@ -1,118 +1,203 @@
-# core/refs.py
-# =============================================================================
-# Chức năng:
-#   - Trích các tham chiếu tài liệu kỹ thuật (AMM, TSM, FIM, AFI, IPC) từ chuỗi văn bản WO.
-#   - Chuẩn hoá chuỗi nhiệm vụ (task) và suy ra ATA04 = "AA-BB".
-#   - Ưu tiên thứ tự manual: TSM/FIM/AFI (cao nhất) > AMM > IPC (thấp nhất).
-#
-# API:
-#   extract_citations(text: str) -> list[dict]
-#     Mỗi dict có dạng: {"manual": "AMM|TSM|FIM|AFI|IPC", "task": "AA-BB[-CC[-DDD[-EEE]]][-SUFFIX]", "ata04": "AA-BB"}
-# =============================================================================
+# core/refs.py - WITH IPC SUPPORT
+import regex as re
+from .constants import ATA_PATTERN
 
-from __future__ import annotations
+# Supported manual types
+SUPPORTED_MANUALS = ["AMM", "TSM", "FIM", "ESPM", "IPC", "CMM", "WDM", "SRM"]
 
-try:
-    import regex as re
-except Exception:  # pragma: no cover
-    import re  # type: ignore
-
-from typing import Iterable, Iterator, Optional, Tuple, List, Dict
-
-# Thứ tự ưu tiên manual
-_MANUAL_PRIORITY = {
-    "TSM": 3,
-    "FIM": 3,
-    "AFI": 3,
-    "AMM": 2,
-    "IPC": 1,
-}
-
-# Regex lõi
-_MANUAL_TAG = r"(?P<manual>AMM|TSM|FIM|AFI|IPC)\b\s*:?"
-_NUM_SEQ = (
-    r"(?P<AA>\d{2})\W{0,3}(?P<BB>\d{2})"
-    r"(?:\W{0,3}(?P<CC>\d{2}))?"
-    r"(?:\W{0,3}(?P<DDD>\d{3}))?"
-    r"(?:\W{0,3}(?P<EEE>\d{3}))?"
-    r"(?:\W{0,3}(?P<SUFFIX>[A-Z]))?"
+# ================================================================================
+# PATTERN 1: Standard manuals (AMM, TSM, FIM, ESPM)
+# Format: AMM 21-21-44-000-001-A, TSM 32-41-00-400-801
+# ================================================================================
+MANUAL_PATTERN = re.compile(
+    r"(?:\b(?:REF|PER|IAW)\s+)?(?P<manual>TSM|FIM|AMM|ESPM)\s*[:;\s-]*\s*"
+    r"(?P<seq>(\d{2}[- ]?\d{2}([- ]?\d{2})?([- ]?\d{2,})?([- ]?[A-Z])?))"
+    r"(\s*\([^)]{1,20}\))?",  # Optional date/revision in parentheses
+    flags=re.I,
 )
-_MANUAL_RE = re.compile(_MANUAL_TAG + r"\s*" + _NUM_SEQ, re.IGNORECASE)
+
+# ================================================================================
+# PATTERN 2: IPC (Illustrated Parts Catalog)
+# Format: IPC 21-21-45 FIG 401 ITEM 21
+#         IPC REF: 24-11-03 Figure 102 Item 5
+#         IPC 27-21-31-901-801 Sheet 1
+# ================================================================================
+IPC_PATTERN = re.compile(
+    r"(?:\b(?:REF|PER|IAW)\s+)?(?P<manual>IPC)\s*[:;\s-]*\s*"
+    r"(?P<seq>\d{2}[- ]?\d{2}[- ]?\d{2}([- ]?\d{2,})?)"  # At least AA-BB-CC format
+    r"(?:\s+(?:FIG(?:URE)?|SHEET|SHT)[\.\s]*(?P<fig>\d+))?"  # Optional FIG/SHEET number
+    r"(?:\s+(?:ITEM|IT|ITM)[\.\s]*(?P<item>\d+))?",  # Optional ITEM number
+    flags=re.I,
+)
 
 
-def _norm_ata04(aa: Optional[str], bb: Optional[str]) -> Optional[str]:
-    if not aa or not bb:
-        return None
-    return f"{aa.zfill(2)}-{bb.zfill(2)}"
+def _normalize_seq(seq: str) -> str:
+    """
+    Normalize sequence to AA-BB-CC-DDD format.
+    Examples:
+        21-21-44-000-001-A → 21-21-44-000-001
+        212144000001A → 21-21-44-000-001
+        21 21 44 000 001 → 21-21-44-000-001
+        21-21-45 → 21-21-45
+    """
+    # Remove revision suffix (single letter at end)
+    seq_clean = re.sub(r"[- ]?[A-Z]$", "", seq, flags=re.I)
+    
+    # Extract only digits
+    digits = re.sub(r"[^\d]", "", seq_clean)
+    
+    if len(digits) >= 4:
+        parts = []
+        parts.append(digits[:2])   # AA
+        parts.append(digits[2:4])  # BB
+        
+        rest = digits[4:]
+        # Split remaining into 2-digit or 3-digit chunks
+        while rest:
+            if len(rest) >= 3 and rest[0] != '0':  # Likely 3-digit task number
+                parts.append(rest[:3])
+                rest = rest[3:]
+            elif len(rest) >= 2:
+                parts.append(rest[:2])
+                rest = rest[2:]
+            else:
+                parts.append(rest)
+                break
+        
+        return "-".join(parts)
+    
+    return seq
 
 
-def _compose_task(aa: str, bb: str, cc: Optional[str], ddd: Optional[str],
-                  eee: Optional[str], suffix: Optional[str]) -> str:
-    parts: List[str] = [aa.zfill(2), bb.zfill(2)]
-    if cc:
-        parts.append(cc.zfill(2))
-    if ddd:
-        parts.append(ddd.zfill(3))
-    if eee:
-        parts.append(eee.zfill(3))
-    task = "-".join(parts)
-    if suffix:
-        task = f"{task}-{suffix.upper()}"
-    return task
-
-
-def _iter_manual_matches(text: str) -> Iterator[Tuple[int, Dict[str, str]]]:
+def extract_citations(text: str):
+    """
+    Extract manual citations from text with support for AMM/TSM/FIM/ESPM/IPC.
+    Returns list of dicts with keys: manual, raw, normalized, ata04, task, fig, item
+    
+    Examples:
+        "REF AMM 21-21-44-000-001-A" → {manual: AMM, ata04: 21-21, task: 21-21-44-000-001}
+        "IPC 21-21-45 FIG 401 ITEM 21" → {manual: IPC, ata04: 21-21, task: 21-21-45, fig: 401, item: 21}
+    """
+    out = []
     if not text:
-        return
-    for m in _MANUAL_RE.finditer(text):
-        gd = m.groupdict()
-        manual = (gd.get("manual") or "").upper()
-        aa, bb = gd.get("AA"), gd.get("BB")
-        cc, ddd = gd.get("CC"), gd.get("DDD")
-        eee, sf = gd.get("EEE"), gd.get("SUFFIX")
-
-        ata04 = _norm_ata04(aa, bb)
-        if not ata04:
-            continue
-
-        task = _compose_task(aa, bb, cc, ddd, eee, sf)
-        yield (m.start(), {"manual": manual, "task": task, "ata04": ata04})
-
-
-def _priority(manual: str) -> int:
-    return {"TSM":3, "FIM":3, "AFI":3, "AMM":2, "IPC":1}.get(manual.upper(), 0)
-
-
-def _dedup_preserve_order(items: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
-    seen = set()
-    out: List[Dict[str, str]] = []
-    for it in items:
-        key = (it.get("manual", ""), it.get("task", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
+        return out
+    
+    # ========== Extract Standard Manuals (AMM/TSM/FIM/ESPM) ==========
+    for m in MANUAL_PATTERN.finditer(text):
+        manual = m.group("manual").upper()
+        raw = m.group("seq")
+        normalized = _normalize_seq(raw)
+        
+        # Extract ATA04 (first 5 chars: AA-BB)
+        ata04 = None
+        task = normalized
+        
+        m2 = re.match(ATA_PATTERN, normalized)
+        if m2:
+            aa, bb = m2.group("aa"), m2.group("bb")
+            ata04 = f"{aa}-{bb}"
+        elif len(normalized) >= 5 and normalized[2] == '-':
+            # Fallback: simple extraction
+            ata04 = normalized[:5]
+        
+        out.append({
+            "manual": manual,
+            "raw": raw,
+            "normalized": normalized,
+            "ata04": ata04,
+            "task": task,
+            "fig": None,
+            "item": None,
+        })
+    
+    # ========== Extract IPC References ==========
+    for m in IPC_PATTERN.finditer(text):
+        manual = "IPC"
+        raw = m.group("seq")
+        normalized = _normalize_seq(raw)
+        fig = m.group("fig") if m.group("fig") else None
+        item = m.group("item") if m.group("item") else None
+        
+        # Extract ATA04 (first 5 chars: AA-BB)
+        ata04 = None
+        if len(normalized) >= 5 and normalized[2] == '-':
+            ata04 = normalized[:5]
+        
+        # Build task identifier (include FIG/ITEM for uniqueness)
+        task = normalized
+        if fig:
+            task += f" FIG{fig}"
+        if item:
+            task += f" IT{item}"
+        
+        out.append({
+            "manual": manual,
+            "raw": raw,
+            "normalized": normalized,
+            "ata04": ata04,
+            "task": task,
+            "fig": fig,
+            "item": item,
+        })
+    
     return out
 
 
-def extract_citations(text: str) -> List[Dict[str, str]]:
-    text = text or ""
-    matches: List[Tuple[int, Dict[str, str]]] = list(_iter_manual_matches(text))
-    if not matches:
-        return []
-    # sort by priority desc, then position asc
-    matches.sort(key=lambda t: (-_priority(t[1]["manual"]), t[0]))
-    ordered = [info for _, info in matches]
-    return _dedup_preserve_order(ordered)
-
-
+# ============== TEST CASES ==============
 if __name__ == "__main__":
-    s = """
-    REF AMM: 21-52-24-000-001-A (AUG 01 2025) AND AMM 21-52-24-400-001-A.
-    Also found TSM 27 51 00 710 and FIM: 29-11-00. AFI 21.21.44.000.001 BLAH.
-    IPC 32-41-00 may appear too.
+    test_cases = [
+        # Standard manuals
+        ("REF AMM 21-21-44-000-001-A (AUG 01 2025)", "AMM", "21-21"),
+        ("AMM: 21-52-24-000-001-A", "AMM", "21-52"),
+        ("TSM 32-41-00-400-801", "TSM", "32-41"),
+        ("PER FIM 24-11-00-001", "FIM", "24-11"),
+        
+        # IPC references
+        ("IPC 21-21-45 FIG 401 ITEM 21", "IPC", "21-21"),
+        ("IPC REF: 24-11-03 Figure 102 Item 5", "IPC", "24-11"),
+        ("IPC 27-21-31-901-801 Sheet 1", "IPC", "27-21"),
+        ("IPC 32-41-00 FIG. 201 IT. 12", "IPC", "32-41"),
+        
+        # Mixed
+        ("REF AMM 21-21-44-000-001 AND IPC 21-21-45 FIG 401", "AMM,IPC", "21-21"),
+    ]
+    
+    print("="*80)
+    print("CITATION EXTRACTION TEST (with IPC support)")
+    print("="*80)
+    
+    for i, (text, expected_manual, expected_ata) in enumerate(test_cases, 1):
+        cites = extract_citations(text)
+        print(f"\n{i}. Input: {text}")
+        
+        if cites:
+            for c in cites:
+                status = "✓" if c['ata04'] == expected_ata else "✗"
+                print(f"   {status} {c['manual']} {c['normalized']}")
+                if c['fig']:
+                    print(f"      FIG: {c['fig']}", end="")
+                if c['item']:
+                    print(f" ITEM: {c['item']}", end="")
+                if c['fig'] or c['item']:
+                    print()
+                print(f"      → ATA04: {c['ata04']}")
+        else:
+            print(f"   ✗ No citations found!")
+    
+    print("\n" + "="*80)
+    print("IPC-SPECIFIC TEST")
+    print("="*80)
+    
+    ipc_text = """
+    FOUND DAMAGED BRACKET AT ENGINE PYLON.
+    REF IPC 54-12-03 FIG 201 ITEM 5
+    C/O REPLACED BRACKET P/N 123456-001
+    IAW IPC 54-12-03 Figure 201 Item 5
     """
-    cits = extract_citations(s)
-    print("CITATIONS:")
-    for c in cits:
-        print(c)
+    
+    cites = extract_citations(ipc_text)
+    print(f"\nText: {ipc_text.strip()}")
+    print(f"\nFound {len(cites)} citation(s):")
+    for c in cites:
+        print(f"  • {c['manual']} {c['normalized']} FIG{c.get('fig','')} IT{c.get('item','')}")
+        print(f"    ATA04: {c['ata04']}")
