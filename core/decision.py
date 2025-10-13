@@ -1,139 +1,108 @@
-# core/decision.py
-from __future__ import annotations
+# core/decision.py - OPTIMIZED VERSION
+from .constants import CONF_MATRIX
 
-from typing import Dict, List, Optional, Tuple
-
-# =============================================================================
-# Decision policy for ATA04 finalization
-# Inputs:
-#   e0: str|None                 # ATA entered by user (E0)
-#   e1_valid: bool               # whether a valid manual citation (E1) exists
-#   e1_ata: str|None             # ATA04 derived from citation (E1)
-#   e2_best: dict|None           # best candidate from TF-IDF (E2), expects {"ata04": str, "score": float}
-#   e2_all: list|None            # full TF-IDF list, e.g. [{"ata04": str, "score": float}, ...] sorted desc
-#
-# Returns:
-#   (decision, confidence, reason)  # strings + float in [0,1]
-#
-# Policy priority (highest → lowest):
-#   1) E1 (manual citation) dominates.
-#   2) E2 (TF-IDF) with strong score + margin.
-#   3) Else REVIEW.
-# =============================================================================
-
-
-def _norm_ata(ata: Optional[str]) -> Optional[str]:
-    if not ata:
-        return None
-    s = str(ata).strip().replace(" ", "").upper()
-    # accept formats like "02-05", "0205", "02.05", "02_05"
-    import re
-    m = re.match(r"^(\d{2})[-._]?(\d{2})$", s)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
-    return s if "-" in s and len(s) >= 5 else None
-
-
-def _extract_margin(e2_all: Optional[List[Dict]]) -> float:
-    """Return difference between top-1 and top-2 scores (0 if insufficient)."""
-    try:
-        if not e2_all or len(e2_all) < 2:
-            return 0.0
-        s1 = float(e2_all[0].get("score", 0.0) or 0.0)
-        s2 = float(e2_all[1].get("score", 0.0) or 0.0)
-        return max(0.0, s1 - s2)
-    except Exception:
-        return 0.0
-
-
-def decide(
-    e0: Optional[str],
-    e1_valid: bool,
-    e1_ata: Optional[str],
-    e2_best: Optional[Dict] = None,
-    e2_all: Optional[List[Dict]] = None,
-    thresholds: Optional[Dict[str, float]] = None,
-    return_explain: bool = False,
-) -> Tuple[str, float, str] | Tuple[str, float, str, Dict]:
+def _is_valid_ata(ata):
     """
-    Make a robust decision using E0/E1/E2.
-    thresholds (optional):
-        - t_e2_strong: float  (default 0.42)  minimum score to accept E2 as strong
-        - t_e2_ok:     float  (default 0.32)  minimum score to accept E2 as acceptable
-        - t_margin:    float  (default 0.08)  minimum margin between top1 and top2
+    Kiểm tra ATA có hợp lệ không (không phải placeholder/dummy).
+    Invalid: 00-00, 99-99, None, empty, quá ngắn
     """
-    cfg = {
-        "t_e2_strong": 0.42,
-        "t_e2_ok": 0.32,
-        "t_margin": 0.08,
-    }
-    if thresholds:
-        cfg.update(thresholds)
+    if not ata or not isinstance(ata, str):
+        return False
+    ata = ata.strip().upper()
+    if len(ata) < 4:
+        return False
+    # Placeholder codes
+    if ata in ["00-00", "0000", "99-99", "9999", "XX-XX"]:
+        return False
+    return True
 
-    E0 = _norm_ata(e0)
-    E1 = _norm_ata(e1_ata)
-    e2_top_ata = _norm_ata(e2_best.get("ata04") if e2_best else None)
-    e2_top_score = float((e2_best or {}).get("score", 0.0) or 0.0)
-    e2_margin = _extract_margin(e2_all)
-
-    # ---- 1) E1 dominates when valid ----------------------------------------
-    if e1_valid and E1:
-        if E0 and E0 == E1:
-            decision, conf, reason = "CONFIRM", 0.92, "E1 (manual) trùng E0"
+def decide(e0, e1_valid, e1_ata, e2_best, e2_all):
+    """
+    Decision logic với xử lý E0 invalid.
+    
+    Priority:
+    1. E0 = E1 = E2 (all valid) → CONFIRM (0.97)
+    2. E1 = E2 ≠ E0 (E1 valid) → CORRECT (0.95)
+    3. E0 invalid + E1 valid → CORRECT (0.92)
+    4. E0 invalid + E2 valid → CORRECT (0.88)
+    5. E2 = E0 (no E1) → CONFIRM (0.86)
+    6. E1 only → CONFIRM (0.92)
+    7. E1 ≠ E2 → REVIEW (0.60)
+    8. E0 only → REVIEW (0.50)
+    9. No evidence → REVIEW (0.40)
+    """
+    e0_valid = _is_valid_ata(e0)
+    e2_ata = e2_best["ata04"] if e2_best else None
+    e2_valid = _is_valid_ata(e2_ata)
+    
+    # === CASE 1: All agree ===
+    if e0_valid and e1_valid and e2_valid and (e0 == e1_ata == e2_ata):
+        return "CONFIRM", CONF_MATRIX["E0_E1_E2_VALID"], "E0 = E1 = E2 (tất cả hợp lệ)."
+    
+    # === CASE 2: E1 = E2, both valid, differ from E0 ===
+    if e1_valid and e2_valid and (e1_ata == e2_ata):
+        if e0_valid and (e0 != e1_ata):
+            return "CORRECT", CONF_MATRIX["E1_E2_NEQ_E0_VALID"], f"E1 = E2 = {e1_ata} ≠ E0 ({e0}) → sửa."
+        elif not e0_valid:
+            return "CORRECT", 0.92, f"E1 = E2 = {e1_ata}; E0 invalid → sửa."
+    
+    # === CASE 3: E0 invalid, but E1 valid ===
+    if not e0_valid and e1_valid and e1_ata:
+        return "CORRECT", 0.92, f"E0 invalid ('{e0}'), E1 citation hợp lệ: {e1_ata} → sửa."
+    
+    # === CASE 4: E0 invalid, but E2 valid (no E1) ===
+    if not e0_valid and e2_valid and e2_ata:
+        return "CORRECT", 0.88, f"E0 invalid ('{e0}'), E2 catalog hợp lệ: {e2_ata} → sửa."
+    
+    # === CASE 5: E2 matches E0, no E1 ===
+    if e0_valid and e2_valid and (e2_ata == e0) and not e1_valid:
+        return "CONFIRM", CONF_MATRIX["E2_EQ_E0_ONLY"], f"E2 = E0 = {e0}; không có E1."
+    
+    # === CASE 6: Only E1 valid ===
+    if e1_valid and e1_ata and not e2_valid:
+        if e0_valid and (e0 == e1_ata):
+            return "CONFIRM", CONF_MATRIX["E1_ONLY_VALID"], f"E1 = E0 = {e1_ata}."
+        elif e0_valid:
+            return "CORRECT", 0.90, f"E1 hợp lệ ({e1_ata}) ≠ E0 ({e0}) → sửa."
         else:
-            # If E2 agrees with E1, boost confidence
-            if e2_top_ata and e2_top_ata == E1 and e2_top_score >= cfg["t_e2_ok"]:
-                decision, conf, reason = "CORRECT", 0.93, "E1 (manual) khác E0; E2 đồng thuận"
-            else:
-                decision, conf, reason = "CORRECT", 0.88, "E1 (manual) khác E0"
-        explain = {
-            "E0": E0, "E1": E1,
-            "E2_top": e2_top_ata, "E2_score": round(e2_top_score, 4), "E2_margin": round(e2_margin, 4),
-            "policy": "E1_priority"
-        }
-        return (decision, conf, reason, explain) if return_explain else (decision, conf, reason)
-
-    # ---- 2) No E1: rely on E2 when strong enough ---------------------------
-    if e2_top_ata:
-        if e2_top_score >= cfg["t_e2_strong"] and e2_margin >= cfg["t_margin"]:
-            # Strong TF-IDF signal
-            if not E0:
-                decision, conf, reason = "CORRECT", 0.82, "E2 mạnh; không có E0"
-            elif E0 == e2_top_ata:
-                decision, conf, reason = "CONFIRM", 0.80, "E2 mạnh; trùng E0"
-            else:
-                decision, conf, reason = "CORRECT", 0.78, "E2 mạnh; khác E0"
-        elif e2_top_score >= cfg["t_e2_ok"]:
-            # Acceptable TF-IDF signal (lower confidence)
-            if not E0:
-                decision, conf, reason = "CORRECT", 0.72, "E2 đủ; không có E0"
-            elif E0 == e2_top_ata:
-                decision, conf, reason = "CONFIRM", 0.70, "E2 đủ; trùng E0"
-            else:
-                decision, conf, reason = "CORRECT", 0.68, "E2 đủ; khác E0"
-        else:
-            # Weak TF-IDF -> REVIEW
-            decision, conf, reason = "REVIEW", 0.55, "E2 yếu; thiếu E1"
-        explain = {
-            "E0": E0, "E1": None,
-            "E2_top": e2_top_ata, "E2_score": round(e2_top_score, 4), "E2_margin": round(e2_margin, 4),
-            "policy": "E2_fallback"
-        }
-        return (decision, conf, reason, explain) if return_explain else (decision, conf, reason)
-
-    # ---- 3) Nothing but E0 --------------------------------------------------
-    decision, conf, reason = "REVIEW", 0.5, "Chỉ có E0"
-    explain = {"E0": E0, "E1": None, "E2_top": None, "E2_score": 0.0, "E2_margin": 0.0, "policy": "E0_only"}
-    return (decision, conf, reason, explain) if return_explain else (decision, conf, reason)
+            return "CORRECT", 0.88, f"E1 hợp lệ ({e1_ata}); E0 invalid → sửa."
+    
+    # === CASE 7: Conflict E1 ≠ E2 ===
+    if e1_valid and e2_valid and (e1_ata != e2_ata):
+        return "REVIEW", CONF_MATRIX["CONFLICT"], f"E1 ({e1_ata}) ≠ E2 ({e2_ata}) → cần xem xét."
+    
+    # === CASE 8: Only E0 valid ===
+    if e0_valid and not (e1_valid or e2_valid):
+        return "REVIEW", CONF_MATRIX["E0_ONLY"], f"Chỉ có E0 ({e0}), không có bằng chứng bổ sung."
+    
+    # === CASE 9: No valid evidence ===
+    return "REVIEW", 0.40, f"Thiếu bằng chứng rõ ràng (E0: '{e0}', E1: {e1_valid}, E2: {e2_valid})."
 
 
-# ====================== Basic self-test ======================
+# ============== TEST CASES ==============
 if __name__ == "__main__":
-    # 1) E1 present & equals E0
-    print(decide("21-21", True, "21-21", {"ata04": "21-21", "score": 0.55}, [{"ata04":"21-21","score":0.55},{"ata04":"21-52","score":0.40}], return_explain=True))
-    # 2) E1 present & differs from E0; E2 agrees with E1
-    print(decide("00-00", True, "21-52", {"ata04": "21-52", "score": 0.51}, [{"ata04":"21-52","score":0.51},{"ata04":"21-21","score":0.35}], return_explain=True))
-    # 3) No E1, strong E2
-    print(decide(None, False, None, {"ata04": "52-35", "score": 0.48}, [{"ata04":"52-35","score":0.48},{"ata04":"21-21","score":0.33}], return_explain=True))
-    # 4) No E1, weak E2
-    print(decide("00-00", False, None, {"ata04": "24-21", "score": 0.25}, [{"ata04":"24-21","score":0.25}], return_explain=True))
+    print("="*60)
+    print("DECISION LOGIC TEST CASES")
+    print("="*60)
+    
+    test_cases = [
+        # (e0, e1_valid, e1_ata, e2_ata, expected_decision)
+        ("21-21", True, "21-21", "21-21", "CONFIRM"),
+        ("21-21", True, "21-52", "21-52", "CORRECT"),
+        ("00-00", True, "21-52", None, "CORRECT"),  # Invalid E0
+        ("00-00", False, None, "21-52", "CORRECT"),  # Invalid E0, catalog only
+        ("21-21", False, None, "21-21", "CONFIRM"),
+        ("21-21", True, "21-52", None, "CORRECT"),
+        ("21-21", False, None, None, "REVIEW"),
+        (None, False, None, None, "REVIEW"),
+    ]
+    
+    for i, (e0, e1_v, e1_a, e2_a, expect) in enumerate(test_cases, 1):
+        e2_best = {"ata04": e2_a, "score": 0.8} if e2_a else None
+        dec, conf, reason = decide(e0, e1_v, e1_a, e2_best, None)
+        status = "✓" if dec == expect else "✗"
+        print(f"{status} Case {i}: E0={e0}, E1={e1_a}, E2={e2_a}")
+        print(f"  → {dec} ({conf:.2f}): {reason}")
+        if dec != expect:
+            print(f"  ⚠ Expected: {expect}")
+        print()
