@@ -1,4 +1,4 @@
-# app.py
+# app.py - OPTIMIZED VERSION
 from __future__ import annotations
 
 import os
@@ -42,8 +42,8 @@ except Exception:
 # --------------------------------
 # Cấu hình trang
 # --------------------------------
-st.set_page_config(page_title="WO → ATA04 Checker (Drive + Memory + Optional LLM)", layout="wide")
-st.title("WO → ATA04 Checker (Drive + Incremental Memory)")
+st.set_page_config(page_title="WO → ATA04 Checker (Optimized)", layout="wide")
+st.title("WO → ATA04 Checker (Drive + Incremental Memory) - OPTIMIZED")
 
 # Khởi tạo kho dữ liệu
 init_db()
@@ -132,7 +132,6 @@ with st.sidebar:
     low_conf_thresh = st.slider("Ngưỡng confidence kích hoạt LLM", 0.0, 1.0, 0.82, 0.01)
 
     st.markdown("---")
-    # Giới hạn số cuộc gọi LLM / mỗi lần xử lý (để không chậm với dataset lớn)
     max_llm_calls = st.number_input("Giới hạn số LLM calls", min_value=0, max_value=5000, value=300, step=50, help="0 để tắt fallback")
     show_debug = st.checkbox("Hiển thị debug", value=False)
 
@@ -360,19 +359,17 @@ if uploaded is not None:
                 evidence_snip[i] = best.get("snippet")
                 evidence_src[i]  = best.get("source")
 
-    # 5) Quyết định + LLM fallback (giới hạn số cuộc gọi)
-   
+    # 5) Quyết định + LLM fallback (giới hạn số cuộc gọi) - OPTIMIZED
     results = []
     llm_calls = 0
     ata_name_map = None
-    
     # Lấy bản đồ tên ATA nếu có (không bắt buộc)
     try:
         if catalog and hasattr(catalog, "name_map"):
             ata_name_map = catalog.name_map()
     except Exception:
         ata_name_map = None
-    
+
     for i in range(len(df)):
         # ========== GATHER EVIDENCE (E0, E1, E2) ==========
         
@@ -409,6 +406,16 @@ if uploaded is not None:
         
         # Xác định ATA_Final (ưu tiên E1 > E2 > E0)
         ata_final = e1_ata or (e2_best.get("ata04") if e2_best else None) or e0_raw
+        
+        # ========== DEBUG OUTPUT (nếu bật) ==========
+        if show_debug and i < 5:
+            st.write(f"**Row {i}:**")
+            st.write(f"- E0 raw: `{e0_raw}`")
+            st.write(f"- E1 ata: `{e1_ata}` (valid: {e1_valid})")
+            st.write(f"- E2 ata: `{e2_best.get('ata04') if e2_best else None}`")
+            st.write(f"- Decision: **{decision}** ({conf:.2f})")
+            st.write(f"- Reason: {reason}")
+            st.write("---")
         
         # ========== LLM FALLBACK (chỉ khi cần thiết & còn quota) ==========
         llm_used = False
@@ -490,10 +497,8 @@ if uploaded is not None:
             "Reason": reason,
             "LLM_Used": llm_used,
         })
-    
+
     res_df = pd.DataFrame(results)
-
-
 
     # 6) Ghép ra Excel – chỉ THÊM cột, giữ nguyên cột gốc & tiêu đề
     out_df = raw_df.copy()
@@ -576,7 +581,7 @@ def _flatten_catalog_to_df(catalog_path: str) -> pd.DataFrame:
 
     rows = []
     for ata, it in items:
-        titles   = _to_str_list(it.get("titles") or it.get("Titles"))
+        titles   = _to_str_list(it.get("titles") or it.get("Titles") or it.get("title"))
         keywords = _to_str_list(it.get("keywords") or it.get("Keywords"))
         samples  = _to_str_list(it.get("samples") or it.get("Samples") or it.get("sample_phrases"))
         source   = it.get("source") or it.get("Source") or ""
