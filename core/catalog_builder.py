@@ -293,7 +293,7 @@ def _extract_class_features_enhanced(
         return [], 0.0
     
     sub = matrix[row_ids]
-    mean_vecRetryVContinuepython    mean_vec = np.asarray(sub.mean(axis=0)).ravel()
+    mean_vec = np.asarray(sub.mean(axis=0)).ravel()
     
     # Boost technical terms
     boost_mask = np.ones_like(mean_vec)
