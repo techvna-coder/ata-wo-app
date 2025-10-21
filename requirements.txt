@@ -1,26 +1,36 @@
+# Core
 streamlit>=1.37
 pandas>=2.2
 openpyxl>=3.1
+numpy>=1.26,<3
+pyarrow>=16.1
+
+# Text processing
 beautifulsoup4>=4.12
 lxml>=5.2
 regex>=2024.5.15
 
-# Khoa học dữ liệu / ML
-numpy>=1.26,<3
+# ML / Vector search
 scikit-learn>=1.5
 scipy>=1.11,<2
 joblib>=1.4
-pyarrow>=16.1
 
-# Tùy chọn (RAG – nếu bật sau)
+# Optional: Advanced features
 duckdb>=1.0
 faiss-cpu>=1.8
 tiktoken>=0.7
 
-# Google Drive
+# Google Drive sync
 pydrive2>=1.20
 google-auth>=2.33
 google-auth-oauthlib>=1.2
 
-# OpenAI SDK (bắt buộc nếu dùng LLM arbitration/ enrich)
+# OpenAI (LLM arbitration)
 openai>=1.40,<2
+
+# Visualization (optional)
+plotly>=5.18
+
+# Testing (dev)
+pytest>=8.0
+pytest-cov>=4.1
