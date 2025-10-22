@@ -30,16 +30,89 @@ def init_db():
     """)
     con.close()
 
-def append_ata_map(df_map: pd.DataFrame, code_col: str, name_col: str):
+def append_ata_map(df_map: pd.DataFrame, code_col: str = None, name_col: str = None):
+    """
+    Tự động xử lý file ATA map có cấu trúc cây (A321 Data ATA map.xlsx).
+    - Nhận dạng code và mô tả từ cột duy nhất.
+    - Kế thừa mô tả từ hệ thống cha.
+    - Gom nhóm về ATA04 và tạo mô tả đầy đủ.
+    """
+    import re
+
     df = df_map.copy()
-    df["ATA04"] = df[code_col].map(_to_ata04)
-    df = df[["ATA04", name_col]].rename(columns={name_col:"Title"}).dropna().drop_duplicates()
+    first_col = df.columns[0]
+    df[first_col] = df[first_col].astype(str).str.strip()
+
+    # 1️⃣ Trích ATA_Code và mô tả (nếu file chỉ có 1 cột)
+    if not code_col or code_col not in df.columns:
+        df["ATA_Code"] = df[first_col].apply(
+            lambda x: re.findall(r"\d{2}(?:-\d{2}){0,3}", x)[0] if re.search(r"\d{2}(?:-\d{2}){0,3}", x) else None
+        )
+    else:
+        df["ATA_Code"] = df[code_col]
+
+    if not name_col or name_col not in df.columns:
+        df["Title"] = df[first_col].apply(
+            lambda x: re.sub(r"^\s*\d{2}(?:-\d{2}){0,3}\s*-\s*", "", x).strip()
+        )
+    else:
+        df["Title"] = df[name_col].astype(str)
+
+    # 2️⃣ Xây map hierarchy cha–con
+    def parent_code(code):
+        if not code or not isinstance(code, str): return None
+        parts = code.split("-")
+        if len(parts) > 2:
+            return "-".join(parts[:-1])
+        elif len(parts) == 2:
+            return parts[0]
+        return None
+
+    df["Parent"] = df["ATA_Code"].apply(parent_code)
+
+    desc_map = {r["ATA_Code"]: r["Title"] for _, r in df.iterrows() if r["ATA_Code"]}
+
+    enriched = []
+    for code, desc in desc_map.items():
+        full_desc = desc
+        p = parent_code(code)
+        # kế thừa mô tả từ cha, ghép theo chiều tăng dần độ chi tiết
+        while p and p in desc_map:
+            full_desc = desc_map[p] + " & " + full_desc
+            p = parent_code(p)
+        enriched.append({"ATA_Code": code, "Full_Description": full_desc})
+
+    df_enriched = pd.DataFrame(enriched)
+
+    # 3️⃣ Tính ATA04 (2 cấp)
+    def to_ata04(code):
+        if not code or not isinstance(code, str): return None
+        parts = code.split("-")
+        if len(parts) >= 2:
+            return "-".join(parts[:2])
+        return code
+
+    df_enriched["ATA04"] = df_enriched["ATA_Code"].apply(to_ata04)
+
+    # 4️⃣ Gộp các dòng cùng ATA04 thành 1 mô tả phong phú
+    agg = (
+        df_enriched.groupby("ATA04")["Full_Description"]
+        .apply(lambda x: " | ".join(sorted(set(x))))
+        .reset_index()
+        .rename(columns={"Full_Description": "Title"})
+    )
+    agg["Source_Count"] = agg["Title"].apply(lambda t: t.count("|") + 1)
+
+    # 5️⃣ Ghi vào parquet (merge nếu đã có dữ liệu cũ)
     if Path(ATA_PARQUET).exists():
         old = pd.read_parquet(ATA_PARQUET)
-        out = pd.concat([old, df], ignore_index=True).drop_duplicates(subset=["ATA04"], keep="last")
+        out = pd.concat([old, agg], ignore_index=True).drop_duplicates(subset=["ATA04"], keep="last")
     else:
-        out = df
+        out = agg
+
     out.to_parquet(ATA_PARQUET, index=False)
+    print(f"✅ ATA map enriched: {len(out)} entries written to {ATA_PARQUET}")
+
 
 # core/store.py (chỉ thay hàm append_wo_training)
 def append_wo_training(df_wo: pd.DataFrame, desc_col: str, act_col: str,
