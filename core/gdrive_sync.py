@@ -49,15 +49,22 @@ def _download_file(drive: GoogleDrive, file_id: str, name: str) -> Path:
 def sync_drive_folder(*args, **kwargs) -> List[Dict[str, Any]]:
     """
     Đồng bộ toàn bộ file trong thư mục Google Drive.
-    Cho phép gọi theo 2 dạng:
+    Tương thích với cả 2 cách gọi:
       - sync_drive_folder(folder_id)
       - sync_drive_folder(drive, folder_id)
     """
+    # Kiểm tra kiểu đối số
     if len(args) == 1:
         folder_id = args[0]
         drive = _auth_drive()
     elif len(args) == 2:
-        drive, folder_id = args
+        # nếu args[0] là GoogleDrive object → hợp lệ
+        if hasattr(args[0], "ListFile"):
+            drive, folder_id = args
+        else:
+            # nếu không phải → coi như đối số đầu tiên chính là folder_id
+            folder_id = args[0]
+            drive = _auth_drive()
     else:
         raise TypeError("sync_drive_folder() requires 1 or 2 arguments: [drive], folder_id")
 
