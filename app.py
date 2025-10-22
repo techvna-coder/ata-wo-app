@@ -276,16 +276,13 @@ def _load_catalog_resource() -> Optional[ATACatalog]:
     return ATACatalog("catalog")
 
 if uploaded is not None:
-    import time
-    from datetime import datetime
-    
     # Giữ nguyên tiêu đề/thứ tự cột gốc để xuất
     raw_df = pd.read_excel(uploaded, dtype=str)
     # Khung nội bộ chuẩn hoá
     df = load_wo_excel(uploaded)
     st.success(f"Đã nạp {len(df)} dòng.")
-    
-    # ===== INITIALIZE CATALOG =====
+
+    # 1) Nạp/Build Catalog
     catalog = None
     if use_catalog:
         try:
@@ -302,318 +299,232 @@ if uploaded is not None:
         except Exception as e:
             st.error(f"Không load được Catalog: {e}")
             st.stop()
-    else:
-        st.error("Cần enable 'Dùng Catalog (TF-IDF) offline' để predict ATA!")
-        st.stop()
-    
-    # ===== GET ATA NAME MAP =====
+
+    # 2) Non-defect filter – chạy 1 pass
+    descs = df["Defect_Text"].tolist()
+    acts  = df["Rectification_Text"].tolist()
+    wtypes = df.get("WO_Type", pd.Series([""] * len(df))).tolist()
+
+    is_tech_list = [is_technical_defect(d, a, wo_type=t) for d, a, t in zip(descs, acts, wtypes)]
+    tech_mask = np.array(is_tech_list, dtype=bool)
+
+    # 3) E1 – trích citations: CHỈ cho dòng nghiêng kỹ thuật HOẶC có hint AMM/TSM/FIM (tránh regex nặng)
+    hint_def = df["Defect_Text"].fillna("").str.contains(r"\b(AMM|TSM|FIM|ESPM)\b", case=False, regex=True)
+    hint_act = df["Rectification_Text"].fillna("").str.contains(r"\b(AMM|TSM|FIM|ESPM)\b", case=False, regex=True)
+    do_cite_mask = (tech_mask | (hint_def | hint_act).to_numpy())
+
+    cited_ata = [None] * len(df)
+    cited_manual = [None] * len(df)
+    cited_task = [None] * len(df)
+    citations_cache: List[Optional[List[dict]]] = [None] * len(df)
+
+    idx_cite = np.where(do_cite_mask)[0]
+    for i in idx_cite:
+        cits = extract_citations(f"{descs[i] or ''} {acts[i] or ''}")
+        if cits:
+            citations_cache[i] = cits
+            for c in cits:
+                if c.get("ata04"):
+                    cited_ata[i] = c["ata04"]
+                    cited_manual[i] = c.get("manual")
+                    cited_task[i] = c.get("task")
+                    break
+
+    # 4) E2 – Catalog theo LÔ cho dòng kỹ thuật
+    derived_task = [None] * len(df)
+    derived_doc  = [None] * len(df)
+    derived_score= [None] * len(df)
+    evidence_snip= [None] * len(df)
+    evidence_src = [None] * len(df)
+
+    if use_catalog and catalog:
+        idxs = np.where(tech_mask)[0].tolist()
+        pairs = [(descs[i], acts[i]) for i in idxs]
+        # Sử dụng predict_batch nếu core/ata_catalog.py đã cập nhật; fallback sang predict từng dòng
+        best_list = None
+        try:
+            best_list, _ = catalog.predict_batch(pairs, top_k=5, return_all=False)
+        except Exception:
+            # fallback
+            best_list = []
+            for d, a in pairs:
+                b, _ = catalog.predict(d, a)
+                best_list.append(b)
+        for k, i in enumerate(idxs):
+            best = best_list[k] if best_list else None
+            if best:
+                derived_task[i]  = best.get("ata04")
+                derived_doc[i]   = best.get("doc")
+                derived_score[i] = best.get("score")
+                evidence_snip[i] = best.get("snippet")
+                evidence_src[i]  = best.get("source")
+
+    # 5) Quyết định + LLM fallback (giới hạn số cuộc gọi) - OPTIMIZED
+    results = []
+    llm_calls = 0
     ata_name_map = None
+    # Lấy bản đồ tên ATA nếu có (không bắt buộc)
     try:
         if catalog and hasattr(catalog, "name_map"):
             ata_name_map = catalog.name_map()
     except Exception:
-        pass
-    
-    # ===== CREATE PREDICTOR =====
-    from core.ata_predictor import ATAPredictor
-    
-    predictor = ATAPredictor(
-        catalog=catalog,
-        ata_name_map=ata_name_map,
-        use_llm=use_llm_fallback,
-        llm_conf_threshold=float(low_conf_thresh),
-        max_llm_calls=int(max_llm_calls),
-        verbose=show_debug
-    )
-    
-    # ===== PREDICT (WITH TIMING) =====
-    start_time = time.time()
-    start_dt = datetime.now()
-    
-    with st.spinner("🔄 Đang xử lý..."):
-        results = predictor.predict_batch(df)
-    
-    end_time = time.time()
-    duration = end_time - start_time
-    throughput = len(df) / duration if duration > 0 else 0
-    
-    # Convert to DataFrame
-    res_df = predictor.to_dataframe(results)
-    
-    # ===== MERGE WITH ORIGINAL =====
+        ata_name_map = None
+
+    for i in range(len(df)):
+        # ========== GATHER EVIDENCE (E0, E1, E2) ==========
+        
+        # E0: ATA Entered (RAW - không filter, để decide() tự validate)
+        e0_raw = df.at[i, "ATA04_Entered"] if "ATA04_Entered" in df.columns else None
+        if pd.isna(e0_raw):
+            e0_raw = None
+        else:
+            e0_raw = str(e0_raw).strip()
+        
+        # E1: Citation extracted (chỉ valid nếu là technical defect VÀ có citation)
+        e1_ata = cited_ata[i]
+        e1_valid = bool(tech_mask[i]) and bool(e1_ata) and isinstance(e1_ata, str) and len(e1_ata) >= 4
+        
+        # E2: Catalog prediction
+        e2_best = None
+        if derived_task[i]:
+            e2_best = {
+                "ata04": derived_task[i],
+                "doc": derived_doc[i],
+                "score": derived_score[i],
+                "snippet": evidence_snip[i],
+                "source": evidence_src[i],
+            }
+        
+        # ========== DECISION LOGIC ==========
+        decision, conf, reason = decide(
+            e0=e0_raw,  # ← KHÔNG FILTER, truyền raw value
+            e1_valid=e1_valid,
+            e1_ata=e1_ata,
+            e2_best=e2_best,
+            e2_all=None
+        )
+        
+        # Xác định ATA_Final (ưu tiên E1 > E2 > E0)
+        ata_final = e1_ata or (e2_best.get("ata04") if e2_best else None) or e0_raw
+        
+        # ========== DEBUG OUTPUT (nếu bật) ==========
+        if show_debug and i < 5:
+            st.write(f"**Row {i}:**")
+            st.write(f"- E0 raw: `{e0_raw}`")
+            st.write(f"- E1 ata: `{e1_ata}` (valid: {e1_valid})")
+            st.write(f"- E2 ata: `{e2_best.get('ata04') if e2_best else None}`")
+            st.write(f"- Decision: **{decision}** ({conf:.2f})")
+            st.write(f"- Reason: {reason}")
+            st.write("---")
+        
+        # ========== LLM FALLBACK (chỉ khi cần thiết & còn quota) ==========
+        llm_used = False
+        ambiguous = (
+            bool(tech_mask[i]) and
+            use_llm_fallback and HAS_LLM and
+            (decision == "REVIEW" or (conf is not None and conf < float(low_conf_thresh)) or not ata_final) and
+            (llm_calls < int(max_llm_calls))
+        )
+        
+        if ambiguous:
+            # Ứng viên (ràng buộc LLM để ổn định)
+            cands = []
+            if e1_valid and e1_ata:
+                cands.append({"ata04": e1_ata, "why": "citation", "score": 1.0})
+            if e2_best and e2_best.get("ata04"):
+                cands.append({"ata04": e2_best.get("ata04"), "why": "tfidf", "score": float(e2_best.get("score") or 0.0)})
+            if e0_raw and isinstance(e0_raw, str) and len(e0_raw) >= 4:
+                cands.append({"ata04": e0_raw.strip(), "why": "entered", "score": 0.5})
+            
+            # Loại trùng và sắp xếp
+            uniq = {}
+            for c in cands:
+                key = (c.get("ata04") or "").upper()
+                if key and key not in uniq:
+                    uniq[key] = c
+            cand_list = sorted(uniq.values(), key=lambda x: -float(x.get("score") or 0.0))
+            
+            # Citations
+            cits = []
+            if citations_cache[i]:
+                for c in citations_cache[i][:5]:
+                    cits.append({"manual": c.get("manual"), "task": c.get("task"), "ata04": c.get("ata04")})
+            
+            try:
+                arb = llm_arbitrate_when_review(
+                    desc=descs[i] or "", action=acts[i] or "",
+                    candidates=cand_list[:5], citations=cits, ata_name_map=ata_name_map,
+                    force_from_candidates=bool(cand_list)
+                )
+                a_llm = (arb.get("ata04") or "").upper() if isinstance(arb, dict) else ""
+                if a_llm:
+                    llm_used = True
+                    ata_final = a_llm
+                    conf_llm = float(arb.get("confidence") or 0.0)
+                    
+                    # Adjust decision based on LLM result
+                    if a_llm == (e1_ata or "").upper():
+                        conf = max(conf or 0.0, 0.92, conf_llm)
+                        decision = "CONFIRM"
+                    else:
+                        conf = max(conf or 0.0, 0.88, conf_llm)
+                        decision = "CORRECT" if ata_final and ata_final != (e0_raw or "") else "CONFIRM"
+                    
+                    reason = (reason or "")
+                    reason = (reason + f" | LLM arbitration: {arb.get('rationale','')[:300]}").strip()
+                    llm_calls += 1
+            except Exception as e:
+                if show_debug:
+                    st.warning(f"LLM call failed for row {i}: {e}")
+        
+        # ========== STORE RESULT ==========
+        results.append({
+            "Is_Technical_Defect": bool(tech_mask[i]),
+            "ATA04_Entered": e0_raw,
+            "ATA04_From_Cited": e1_ata,
+            "Cited_Manual": cited_manual[i],
+            "Cited_Task": cited_task[i],
+            "Cited_Exists": False,
+            "ATA04_Derived": derived_task[i],
+            "Derived_Task": derived_task[i],
+            "Derived_DocType": derived_doc[i],
+            "Derived_Score": derived_score[i],
+            "Evidence_Snippet": evidence_snip[i],
+            "Evidence_Source": evidence_src[i],
+            "Decision": decision,
+            "ATA04_Final": ata_final,
+            "Confidence": conf,
+            "Reason": reason,
+            "LLM_Used": llm_used,
+        })
+
+    res_df = pd.DataFrame(results)
+
+    # 6) Ghép ra Excel – chỉ THÊM cột, giữ nguyên cột gốc & tiêu đề
     out_df = raw_df.copy()
-    for col in res_df.columns:
-        out_df[col] = res_df[col].astype(object)
-    
-    # Remove empty WO_Number column if exists
+    out_df["Is_Technical_Defect"] = res_df["Is_Technical_Defect"].astype(object)
+    out_df["ATA04_Final"]         = res_df["ATA04_Final"].astype(object)
+    out_df["Confidence"]          = res_df["Confidence"].astype(object)
+    out_df["Decision"]            = res_df["Decision"].astype(object)
+    out_df["Reason"]              = res_df["Reason"].astype(object)
+
+    # Xoá WO_Number trống hoàn toàn (nếu có)
     if "WO_Number" in out_df.columns:
         if out_df["WO_Number"].replace(r"^\s*$", np.nan, regex=True).isna().all():
             out_df = out_df.drop(columns=["WO_Number"])
-    
-    # ===== DISPLAY SUMMARY =====
-    st.success(f"✅ Processed {len(df)} WOs in {duration:.1f}s ({throughput:.1f} WO/s)")
-    
-    st.subheader("📊 Summary Metrics")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        n_tech = sum(r.is_technical for r in results)
-        st.metric("Technical Defects", f"{n_tech}/{len(results)}", 
-                  f"{n_tech/len(results)*100:.1f}%")
-    
-    with col2:
-        n_confirm = sum(1 for r in results if r.decision == "CONFIRM")
-        st.metric("CONFIRM", n_confirm, 
-                  f"{n_confirm/len(results)*100:.1f}%")
-    
-    with col3:
-        n_correct = sum(1 for r in results if r.decision == "CORRECT")
-        st.metric("CORRECT", n_correct,
-                  f"{n_correct/len(results)*100:.1f}%")
-    
-    with col4:
-        n_review = sum(1 for r in results if r.decision == "REVIEW")
-        st.metric("REVIEW", n_review,
-                  f"{n_review/len(results)*100:.1f}%", 
-                  delta="⚠️ Need attention" if n_review > 0 else None)
-    
-    # ===== EVIDENCE STATISTICS =====
-    with st.expander("🔍 Evidence Statistics"):
-        col_e1, col_e2, col_e3 = st.columns(3)
-        
-        with col_e1:
-            n_e0 = sum(1 for r in results if r.e0 and r.e0.is_valid())
-            st.metric("E0 (Entered)", f"{n_e0}/{len(results)}")
-        
-        with col_e2:
-            n_e1 = sum(1 for r in results if r.e1 and r.e1.is_valid())
-            n_tech = sum(1 for r in results if r.is_technical)
-            st.metric("E1 (Citation)", f"{n_e1}/{n_tech}" if n_tech > 0 else "0/0")
-        
-        with col_e3:
-            n_e2 = sum(1 for r in results if r.e2 and r.e2.is_valid())
-            st.metric("E2 (Catalog)", f"{n_e2}/{n_tech}" if n_tech > 0 else "0/0")
-    
-    # ===== CONFIDENCE DISTRIBUTION =====
-    with st.expander("📈 Confidence Distribution"):
-        try:
-            import plotly.express as px
-            
-            conf_data = pd.DataFrame({
-                "Confidence": [r.confidence for r in results],
-                "Decision": [r.decision for r in results]
-            })
-            
-            fig = px.histogram(
-                conf_data, 
-                x="Confidence", 
-                color="Decision",
-                nbins=20,
-                title="Confidence Score Distribution",
-                color_discrete_map={
-                    "CONFIRM": "#28a745",
-                    "CORRECT": "#ffc107", 
-                    "REVIEW": "#dc3545"
-                }
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        except ImportError:
-            st.info("Install plotly for visualization: pip install plotly")
-    
-    # ===== MAIN RESULTS TABLE =====
-    st.subheader("📋 Results Table")
-    
-    # Filters
-    col_f1, col_f2, col_f3 = st.columns(3)
-    
-    with col_f1:
-        filter_decision = st.multiselect(
-            "Filter by Decision",
-            ["CONFIRM", "CORRECT", "REVIEW"],
-            default=["CONFIRM", "CORRECT", "REVIEW"]
-        )
-    
-    with col_f2:
-        filter_tech = st.radio(
-            "Filter by Type",
-            ["All", "Technical Only", "Non-Technical Only"],
-            index=0
-        )
-    
-    with col_f3:
-        min_conf = st.slider(
-            "Min Confidence",
-            0.0, 1.0, 0.0, 0.05
-        )
-    
-    # Apply filters
-    filtered_df = out_df.copy()
-    
-    if filter_decision:
-        filtered_df = filtered_df[filtered_df["Decision"].isin(filter_decision)]
-    
-    if filter_tech == "Technical Only":
-        filtered_df = filtered_df[filtered_df["Is_Technical_Defect"] == True]
-    elif filter_tech == "Non-Technical Only":
-        filtered_df = filtered_df[filtered_df["Is_Technical_Defect"] == False]
-    
-    if "Confidence" in filtered_df.columns:
-        filtered_df = filtered_df[
-            (filtered_df["Confidence"].isna()) | 
-            (filtered_df["Confidence"] >= min_conf)
-        ]
-    
-    st.info(f"Showing {len(filtered_df)}/{len(out_df)} rows")
-    
-    # Display columns
-    view_cols = [
-        "Is_Technical_Defect", 
-        "ATA04_Entered",
-        "ATA04_From_Cited",
-        "ATA04_Derived",
-        "ATA04_Final", 
-        "Confidence", 
-        "Decision", 
-        "Reason"
-    ]
-    
-    # Color coding for decisions
-    def highlight_decision(row):
-        colors = {
-            "CONFIRM": "background-color: #d4edda; color: #155724",
-            "CORRECT": "background-color: #fff3cd; color: #856404", 
-            "REVIEW": "background-color: #f8d7da; color: #721c24"
-        }
-        decision = row.get("Decision", "")
-        style = colors.get(decision, "")
-        return [style] * len(row)
-    
-    display_df = filtered_df[[c for c in view_cols if c in filtered_df.columns]].head(200)
-    
-    try:
-        styled_df = display_df.style.apply(highlight_decision, axis=1)
-        st.dataframe(styled_df, use_container_width=True, height=600)
-    except Exception:
-        # Fallback without styling
-        st.dataframe(display_df, use_container_width=True, height=600)
-    
-    # ===== DEBUG INFO =====
-    if show_debug:
-        st.subheader("🐛 Debug Information")
-        
-        # Show detailed evidence for first 5 rows
-        debug_count = min(5, len(results))
-        st.write(f"Showing details for first {debug_count} rows:")
-        
-        for i in range(debug_count):
-            r = results[i]
-            
-            with st.expander(f"Row {i}: {r.ata04_final or 'N/A'} ({r.decision}, conf={r.confidence:.2f})"):
-                st.write("**WO Info:**")
-                wo = predictor  # Access from closure - we can improve this
-                st.code(f"Technical: {r.is_technical}")
-                
-                st.write("**Evidences:**")
-                
-                if r.e0:
-                    st.write(f"- **E0 (Entered):** `{r.e0.ata04}` (conf: {r.e0.confidence:.2f})")
-                    st.json(r.e0.metadata)
-                else:
-                    st.write("- E0: None")
-                
-                if r.e1:
-                    st.write(f"- **E1 (Citation):** `{r.e1.ata04}` (conf: {r.e1.confidence:.2f})")
-                    st.json(r.e1.metadata)
-                else:
-                    st.write("- E1: None")
-                
-                if r.e2:
-                    st.write(f"- **E2 (Catalog):** `{r.e2.ata04}` (conf: {r.e2.confidence:.2f})")
-                    st.json(r.e2.metadata)
-                else:
-                    st.write("- E2: None")
-                
-                st.write(f"**Final Decision:** {r.decision} (confidence: {r.confidence:.2f})")
-                st.write(f"**Reason:** {r.reason}")
-                
-                if r.llm_used and r.llm_result:
-                    st.write("**LLM Result:**")
-                    st.json(r.llm_result)
-        
-        # Cache statistics
-        from core.ata_predictor import get_cache_stats
-        cache_stats = get_cache_stats()
-        st.write("**Citation Cache:**")
-        st.json(cache_stats)
-    
-    # ===== DOWNLOAD RESULTS =====
-    st.subheader("💾 Download Results")
-    
+
+    st.subheader("Kết quả (xem nhanh tối đa 200 dòng)")
+    view_cols = ["Is_Technical_Defect", "ATA04_Final", "Confidence", "Decision", "Reason"]
+    st.dataframe(out_df[[c for c in view_cols if c in out_df.columns]].head(200), use_container_width=True)
+
     from pathlib import Path as _Path
-    
     out_name = f"{_Path(uploaded.name).stem}_ATA_checked.xlsx"
     path = write_result(out_df, path=out_name)
-    
-    col_d1, col_d2 = st.columns(2)
-    
-    with col_d1:
-        st.download_button(
-            "📥 Download Full Results (Excel)",
-            data=open(path, "rb"),
-            file_name=out_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary"
-        )
-    
-    with col_d2:
-        # Download filtered results
-        if len(filtered_df) < len(out_df):
-            filtered_name = f"{_Path(uploaded.name).stem}_filtered.xlsx"
-            filtered_path = write_result(filtered_df, path=filtered_name)
-            st.download_button(
-                "📥 Download Filtered Results",
-                data=open(filtered_path, "rb"),
-                file_name=filtered_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-    
-    # ===== PERFORMANCE LOG =====
-    if use_llm_fallback:
-        llm_used_count = sum(1 for r in results if r.llm_result)
-        llm_flagged = sum(1 for r in results if r.llm_used)
-        st.info(f"🤖 LLM: {llm_used_count}/{llm_flagged} flagged calls made (quota: {max_llm_calls})")
-    
-    # Save performance log
-    perf_log = {
-        "timestamp": start_dt.isoformat(),
-        "filename": uploaded.name,
-        "n_wos": len(df),
-        "n_technical": sum(1 for r in results if r.is_technical),
-        "duration_sec": round(duration, 2),
-        "throughput_per_sec": round(throughput, 2),
-        "decisions": {
-            "CONFIRM": sum(1 for r in results if r.decision == "CONFIRM"),
-            "CORRECT": sum(1 for r in results if r.decision == "CORRECT"),
-            "REVIEW": sum(1 for r in results if r.decision == "REVIEW"),
-        },
-        "evidences": {
-            "E0": sum(1 for r in results if r.e0 and r.e0.is_valid()),
-            "E1": sum(1 for r in results if r.e1 and r.e1.is_valid()),
-            "E2": sum(1 for r in results if r.e2 and r.e2.is_valid()),
-        },
-        "llm_calls": llm_used_count if use_llm_fallback else 0,
-        "avg_confidence": float(np.mean([r.confidence for r in results])),
-    }
-    
-    # Optionally save log
-    try:
-        log_dir = Path("data_store/performance_logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"perf_{start_dt.strftime('%Y%m%d_%H%M%S')}.json"
-        log_file.write_text(json.dumps(perf_log, indent=2))
-    except Exception:
-        pass
+    st.download_button("Tải kết quả Excel", data=open(path, "rb"), file_name=out_name)
+
+    if show_debug:
+        st.info(f"LLM calls used: {llm_calls}")
+
 # --------------------------------
 # BỔ SUNG: Kiểm tra & tải Catalog
 # --------------------------------
