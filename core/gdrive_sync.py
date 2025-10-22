@@ -1,117 +1,115 @@
-import json
-import re
+# core/gdrive_sync.py
+from __future__ import annotations
+import re, json, io, time
 from pathlib import Path
-from typing import List, Dict
-
+from typing import List, Dict, Any
+import pandas as pd
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 
-MANIFEST = "data_store/manifest.json"
-INGEST_DIR = "data_store/ingest"
+DATA_DIR = Path("data_store")
+INGEST_DIR = DATA_DIR / "ingest"
+MANIFEST_FILE = DATA_DIR / "manifest.json"
 
+def _clean_colnames(df: pd.DataFrame) -> pd.DataFrame:
+    """Chuẩn hóa tên cột, loại bỏ ký tự ẩn (expand_more, chevron_right, \xa0...)."""
+    clean_cols = []
+    for c in df.columns:
+        c2 = re.sub(r"[\xa0\s]+", " ", str(c))
+        c2 = re.sub(r"(expand_more|chevron_right)\s*", "", c2, flags=re.I)
+        clean_cols.append(c2.strip())
+    df.columns = clean_cols
+    return df
 
-def _ensure_dirs():
-    Path(INGEST_DIR).mkdir(parents=True, exist_ok=True)
-    Path("data_store").mkdir(parents=True, exist_ok=True)
-
-def _load_manifest() -> Dict:
-    p = Path(MANIFEST)
-    if p.exists():
-        return json.loads(p.read_text(encoding="utf-8"))
-    return {"by_id": {}}
-
-def _save_manifest(m: Dict):
-    Path(MANIFEST).write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
-
-def _auth_service_account(sa_json_path: str):
-    """
-    Xác thực service account cho pydrive2 bằng config nội tuyến.
-    Tránh dùng LoadServiceConfigSettings() để khỏi phụ thuộc file cấu hình mặc định.
-    """
-    gauth = GoogleAuth(settings={
-        "client_config_backend": "service",
-        "service_config": {
-            "client_json_file_path": sa_json_path
-        }
-    })
-    gauth.ServiceAuth()
+def _auth_drive() -> GoogleDrive:
+    """Xác thực service account."""
+    gauth = GoogleAuth()
+    gauth.LoadCredentialsFile("service_account.json")
+    if not gauth.credentials:
+        raise RuntimeError("❌ Không tìm thấy file service_account.json.")
+    gauth.LocalWebserverAuth()
     return GoogleDrive(gauth)
 
-def list_folder_files(drive: GoogleDrive, folder_id: str):
-    q = f"'{folder_id}' in parents and trashed = false"
-    file_list = []
-    # pydrive2 đã handle phân trang nội bộ trong GetList()
-    fl = drive.ListFile({'q': q, 'maxResults': 1000}).GetList()
-    file_list.extend(fl)
-    return file_list
+def _load_manifest() -> Dict[str, Any]:
+    if MANIFEST_FILE.exists():
+        return json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
+    return {"by_id": {}}
 
-def sync_drive_folder(folder_id: str, sa_json_path: str) -> List[str]:
-    """
-    Đồng bộ incremental 1 thư mục Drive về data_store/ingest.
-    - Tự export Google Sheets thành .xlsx
-    - Chỉ nhận file Excel (.xlsx/.xls)
-    Trả về danh sách file path đã được tải/cập nhật.
-    """
-    _ensure_dirs()
-    try:
-        drive = _auth_service_account(sa_json_path)
-    except Exception as e:
-        raise RuntimeError(f"Auth lỗi (service account): {e}")
+def _save_manifest(manifest: Dict[str, Any]):
+    MANIFEST_FILE.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
 
+def _download_file(drive: GoogleDrive, file_id: str, name: str) -> Path:
+    """Tải file từ Google Drive."""
+    file_path = INGEST_DIR / name
+    INGEST_DIR.mkdir(parents=True, exist_ok=True)
+    f = drive.CreateFile({"id": file_id})
+    f.GetContentFile(str(file_path))
+    return file_path
+
+def sync_drive_folder(folder_id: str) -> List[Dict[str, Any]]:
+    """
+    Đồng bộ toàn bộ file trong thư mục Google Drive (theo folder_id).
+    Chỉ tải file .xlsx/.xls. Làm sạch tên cột sau khi tải.
+    """
+    drive = _auth_drive()
     manifest = _load_manifest()
-    by_id = manifest.get("by_id", {})
 
-    try:
-        files = list_folder_files(drive, folder_id)
-    except Exception as e:
-        raise RuntimeError(f"Không list được folder '{folder_id}': {e}")
+    file_list = drive.ListFile({'q': f"'{folder_id}' in parents and trashed=false"}).GetList()
+    synced_files = []
 
-    changed_paths = []
-
-    for f in files:
+    for f in file_list:
+        name = f["title"]
         fid = f["id"]
-        name = f.get("title") or f.get("name")
-        mime = f.get("mimeType", "")
-        modified = f.get("modifiedDate") or f.get("modifiedTime") or ""
+        mime = f["mimeType"]
+        if not (name.endswith(".xlsx") or name.endswith(".xls")):
+            continue  # bỏ qua file không phải Excel
 
-        # Bỏ qua thư mục con
-        if mime == "application/vnd.google-apps.folder":
-            continue
+        print(f"📥 Phát hiện file: {name} ({fid})")
+        file_path = _download_file(drive, fid, name)
 
-        # Google Sheets → export .xlsx
-        if mime == "application/vnd.google-apps.spreadsheet":
-            # tên file local đảm bảo có .xlsx
-            local_path = str(Path(INGEST_DIR) / (name if name.lower().endswith(".xlsx") else f"{name}.xlsx"))
-            rec = by_id.get(fid, {})
-            if rec.get("modified") == modified and rec.get("name") == name:
-                continue
-            try:
-                gfile = drive.CreateFile({"id": fid})
-                gfile.GetContentFile(
-                    local_path,
-                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-            except Exception as e:
-                raise RuntimeError(f"Export Google Sheet '{name}' lỗi: {e}")
-            by_id[fid] = {"name": name, "modified": modified, "path": local_path}
-            changed_paths.append(local_path)
-            continue
+        # Đọc thử để nhận diện nhanh loại file
+        try:
+            df = pd.read_excel(file_path, dtype=str, nrows=50)
+            df = _clean_colnames(df)
 
-        # File Excel chuẩn tải trực tiếp
-        if re.search(r"\.(xlsx|xls)$", name, flags=re.I):
-            rec = by_id.get(fid, {})
-            if rec.get("modified") == modified and rec.get("name") == name:
-                continue
-            local_path = str(Path(INGEST_DIR) / name)
-            try:
-                gfile = drive.CreateFile({"id": fid})
-                gfile.GetContentFile(local_path)
-            except Exception as e:
-                raise RuntimeError(f"Tải file '{name}' lỗi: {e}")
-            by_id[fid] = {"name": name, "modified": modified, "path": local_path}
-            changed_paths.append(local_path)
-        # Bỏ qua các loại file khác
+            # Nhận diện loại file (ATA_MAP / WO)
+            kind = "unknown"
+            if len(df.columns) == 1:
+                sample = " ".join(df.iloc[:, 0].astype(str).tolist())
+                if len(re.findall(r"\b\d{2}-\d{2}(?:-\d{2})?\b", sample)) >= 3:
+                    kind = "ATA_MAP"
+            else:
+                cols_lower = [c.lower() for c in df.columns]
+                if any("ata" in c for c in cols_lower) and any(
+                    re.search(r"(title|name|system|desc|mô tả|mo ta)", c, re.I) for c in cols_lower
+                ):
+                    kind = "ATA_MAP"
+                elif any(re.search(r"(defect|action|rectification)", c, re.I) for c in cols_lower):
+                    kind = "WO"
 
-    manifest["by_id"] = by_id
+            manifest["by_id"][fid] = {
+                "name": name,
+                "kind": kind,
+                "updated": f["modifiedDate"],
+                "size": f["fileSize"],
+                "path": str(file_path),
+                "time_synced": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            synced_files.append({"id": fid, "name": name, "kind": kind, "path": str(file_path)})
+            print(f"✅ Đã đồng bộ: {name} → loại: {kind}")
+
+        except Exception as e:
+            print(f"⚠️ Lỗi đọc {name}: {e}")
+            manifest["by_id"][fid] = {"name": name, "kind": "error", "error": str(e)}
+
     _save_manifest(manifest)
-    return changed_paths
+    return synced_files
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Đồng bộ file từ Google Drive folder.")
+    parser.add_argument("--folder", required=True, help="Google Drive folder ID")
+    args = parser.parse_args()
+    files = sync_drive_folder(args.folder)
+    print(f"\nHoàn tất đồng bộ: {len(files)} file được cập nhật.")
