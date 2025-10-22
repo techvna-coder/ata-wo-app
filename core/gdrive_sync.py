@@ -46,12 +46,22 @@ def _download_file(drive: GoogleDrive, file_id: str, name: str) -> Path:
     f.GetContentFile(str(file_path))
     return file_path
 
-def sync_drive_folder(folder_id: str) -> List[Dict[str, Any]]:
+def sync_drive_folder(*args, **kwargs) -> List[Dict[str, Any]]:
     """
-    Đồng bộ toàn bộ file trong thư mục Google Drive (theo folder_id).
-    Chỉ tải file .xlsx/.xls. Làm sạch tên cột sau khi tải.
+    Đồng bộ toàn bộ file trong thư mục Google Drive.
+    Cho phép gọi theo 2 dạng:
+      - sync_drive_folder(folder_id)
+      - sync_drive_folder(drive, folder_id)
     """
-    drive = _auth_drive()
+    # Xử lý linh hoạt số đối số
+    if len(args) == 1:
+        folder_id = args[0]
+        drive = _auth_drive()
+    elif len(args) == 2:
+        drive, folder_id = args
+    else:
+        raise TypeError("sync_drive_folder() requires 1 or 2 arguments: [drive], folder_id")
+
     manifest = _load_manifest()
 
     file_list = drive.ListFile({'q': f"'{folder_id}' in parents and trashed=false"}).GetList()
