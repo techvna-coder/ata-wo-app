@@ -38,7 +38,25 @@ def _find_col(df: pd.DataFrame, pats: List[str]) -> Optional[str]:
 
 def classify_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
     """Phân loại 1 DataFrame là ATA map hay WO, và xác định các cột liên quan."""
+
     cols_lower = [c.lower() for c in df.columns]
+
+    # 🩵 NEW: nhận diện dạng 'A321 Data ATA map.xlsx' có 1 cột duy nhất
+    if len(df.columns) == 1:
+        col0 = df.columns[0]
+        sample = " ".join(df[col0].head(10).astype(str).tolist())
+        # Nếu có pattern ATA code như '79-21-42' xuất hiện nhiều
+        if len(re.findall(r"\b\d{2}-\d{2}(?:-\d{2})?\b", sample)) >= 3:
+            return {
+                "kind": "ATA_MAP",
+                "desc_col": col0,
+                "action_col": None,
+                "ata_final_col": None,
+                "ata_entered_col": None,
+                "columns": list(df.columns),
+            }
+
+    # 🩶 logic cũ (vẫn giữ nguyên)
     is_ata_map = (
         any(re.search(r"ata.*0?4|^ata$|code", c) for c in cols_lower)
         and any(re.search(r"name|title|system|mô tả|mo ta|description", c) for c in cols_lower)
@@ -65,7 +83,6 @@ def classify_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
         "ata_entered_col": ata_entered_col,
         "columns": list(df.columns),
     }
-
 def load_manifest() -> Dict[str, Any]:
     if MANIFEST.exists():
         return json.loads(MANIFEST.read_text(encoding="utf-8"))
