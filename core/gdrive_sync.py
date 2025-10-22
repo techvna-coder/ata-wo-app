@@ -22,12 +22,11 @@ def _clean_colnames(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _auth_drive() -> GoogleDrive:
-    """Xác thực service account."""
+    """Xác thực service account (không cần LocalWebserverAuth)."""
     gauth = GoogleAuth()
     gauth.LoadCredentialsFile("service_account.json")
     if not gauth.credentials:
-        raise RuntimeError("❌ Không tìm thấy file service_account.json.")
-    gauth.LocalWebserverAuth()
+        gauth.ServiceAuth()  # dùng service account thay vì web browser
     return GoogleDrive(gauth)
 
 def _load_manifest() -> Dict[str, Any]:
