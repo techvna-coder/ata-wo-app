@@ -53,7 +53,6 @@ def sync_drive_folder(*args, **kwargs) -> List[Dict[str, Any]]:
       - sync_drive_folder(folder_id)
       - sync_drive_folder(drive, folder_id)
     """
-    # Xử lý linh hoạt số đối số
     if len(args) == 1:
         folder_id = args[0]
         drive = _auth_drive()
@@ -63,7 +62,6 @@ def sync_drive_folder(*args, **kwargs) -> List[Dict[str, Any]]:
         raise TypeError("sync_drive_folder() requires 1 or 2 arguments: [drive], folder_id")
 
     manifest = _load_manifest()
-
     file_list = drive.ListFile({'q': f"'{folder_id}' in parents and trashed=false"}).GetList()
     synced_files = []
 
