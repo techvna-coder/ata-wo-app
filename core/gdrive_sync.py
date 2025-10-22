@@ -8,6 +8,7 @@ from pydrive2.drive import GoogleDrive
 
 MANIFEST = "data_store/manifest.json"
 INGEST_DIR = "data_store/ingest"
+df.columns = [re.sub(r"[\xa0\s]+", " ", str(c)).strip() for c in df.columns]
 
 def _ensure_dirs():
     Path(INGEST_DIR).mkdir(parents=True, exist_ok=True)
