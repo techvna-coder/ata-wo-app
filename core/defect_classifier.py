@@ -57,6 +57,12 @@ ROUTINE_KEYWORDS = [
     r'\bbrake\s+(wear|worn|pad)\b',
     r'\bbrake\s+lining\b',
     
+    # Wiper - only if explicitly "wear" or "due replacement"
+    r'\bwiper\s+(wear|worn)\b',
+    r'\bwiper\s+blade\s+wear\b',
+    r'\bwiper\s+due\s+replacement\b',
+    r'\bscheduled\s+wiper\b',
+    
     # Paint (cosmetic, not reliability issue)
     r'\bpaint\s+(chip|scratch|peel)\b',
     r'\bsơn\s+(bong|trầy|xước)\b',
@@ -93,6 +99,17 @@ DEFECT_KEYWORDS = [
     r'\bunserviceable\b',
     r'\bnot\s+working\b',
     r'\bdoes\s+not\s+work\b',
+    
+    # Performance degradation
+    r'\bpoor\b',
+    r'\bdegraded\b',
+    r'\bdeteriorat(ed|ing)\b',
+    r'\bunsatisfactory\b',
+    r'\binadequate\b',
+    r'\binsufficient\b',
+    r'\bbelow\s+standard\b',
+    r'\bnot\s+acceptable\b',
+    r'\bunacceptable\b',
     
     # Damage
     r'\bdamage(d)?\b',
